@@ -50,8 +50,14 @@ private:
 		vk::raii::Buffer yuv = nullptr;
 		vk::raii::DeviceMemory mem = nullptr;
 		NV_ENC_REGISTERED_PTR nvenc_resource;
+		uint64_t pending_frame_index = 0;
+		int64_t copy_submit_ns = 0;
 	};
 	std::array<in_t, num_slots> in;
+
+	vk::raii::QueryPool timestamp_pool = nullptr;
+	float timestamp_period_ns = 0.f;
+	bool timestamp_supported = false;
 
 	float fps;
 	uint64_t bitrate;

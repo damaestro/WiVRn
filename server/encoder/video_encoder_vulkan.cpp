@@ -20,7 +20,9 @@
 
 #include "encoder/encoder_settings.h"
 #include "inplace_vector.hpp"
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include <iostream>
@@ -560,6 +562,24 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		vk.name(query_pool, std::format("vulkan encoder {} query pool", stream_idx));
 	}
 
+	// timestamp query pool (for GPU-side encode duration measurement)
+	{
+		auto props = vk.physical_device.getProperties();
+		timestamp_period_ns = props.limits.timestampPeriod;
+		// Need timestamps to be valid on the video-encode queue.
+		auto qprops = vk.physical_device.getQueueFamilyProperties();
+		if (vk.encode_queue_family_index < qprops.size())
+			timestamp_supported = qprops[vk.encode_queue_family_index].timestampValidBits > 0;
+		if (timestamp_supported)
+		{
+			timestamp_pool = vk.device.createQueryPool(vk::QueryPoolCreateInfo{
+			        .queryType = vk::QueryType::eTimestamp,
+			        .queryCount = num_slots * 2,
+			});
+			vk.name(timestamp_pool, std::format("vulkan encoder {} timestamp pool", stream_idx));
+		}
+	}
+
 	// command pools
 	{
 		video_command_pool = vk.device.createCommandPool(
@@ -779,6 +799,8 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 	}
 
 	video_cmd_buf.resetQueryPool(*query_pool, encode_slot, 1);
+	if (*timestamp_pool)
+		video_cmd_buf.resetQueryPool(*timestamp_pool, encode_slot * 2, 2);
 
 	auto & dpb = (dpb_state &)*idr;
 	std::unique_lock lock(dpb.mutex);
@@ -904,7 +926,13 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		encode_info.setReferenceSlots(ref_slot->info);
 
 	video_cmd_buf.beginQuery(*query_pool, encode_slot, {});
+	if (*timestamp_pool)
+		video_cmd_buf.writeTimestamp2(vk::PipelineStageFlagBits2::eVideoEncodeKHR,
+		                              *timestamp_pool, encode_slot * 2);
 	video_cmd_buf.encodeVideoKHR(encode_info);
+	if (*timestamp_pool)
+		video_cmd_buf.writeTimestamp2(vk::PipelineStageFlagBits2::eVideoEncodeKHR,
+		                              *timestamp_pool, encode_slot * 2 + 1);
 	video_cmd_buf.endQuery(*query_pool, encode_slot);
 	video_cmd_buf.endVideoCodingKHR(vk::VideoEndCodingInfoKHR{});
 
@@ -970,6 +998,8 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 
 	++dpb.frame_num;
 
+	slot_item.pending_frame_index = frame_index;
+	slot_item.encode_submit_ns = os_monotonic_get_ns();
 	vk.device.resetFences(*slot_item.fence);
 	{
 		vk::CommandBufferSubmitInfo cmd_info{
@@ -1034,6 +1064,24 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 	if (res != vk::Result::eSuccess)
 	{
 		std::cerr << "device.getQueryPoolResults: " << vk::to_string(res) << std::endl;
+	}
+
+	if (*timestamp_pool)
+	{
+		auto [tres, ts] = timestamp_pool.getResults<uint64_t>(
+		        encode_slot * 2, 2,
+		        2 * sizeof(uint64_t), sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (tres == vk::Result::eSuccess and ts[1] >= ts[0])
+		{
+			const int64_t gpu_duration_ns = static_cast<int64_t>((ts[1] - ts[0]) * timestamp_period_ns);
+			const int64_t gpu_begin = slot_item.encode_submit_ns;
+			const int64_t gpu_end = gpu_begin + gpu_duration_ns;
+			wivrn::trace::gpu_slice(wivrn::trace::gpu_track::vulkan_encode,
+			                        "encodeVideoKHR",
+			                        gpu_begin, gpu_end,
+			                        slot_item.pending_frame_index, stream_idx);
+		}
 	}
 
 	// We don't copy the whole buffer, but an estimate of how much we'll need

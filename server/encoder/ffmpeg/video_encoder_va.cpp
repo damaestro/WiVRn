@@ -23,7 +23,9 @@
 
 #include "encoder/encoder_settings.h"
 
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include <drm_fourcc.h>
@@ -430,9 +432,26 @@ video_encoder_va::video_encoder_va(wivrn::vk_bundle & vk,
 			vk.device.bindImageMemory2(bind_info);
 		}
 	}
+
+	// Vulkan timestamp pool for the Vulkan→VAAPI luma/chroma copy step.
+	{
+		auto props = vk.physical_device.getProperties();
+		timestamp_period_ns = props.limits.timestampPeriod;
+		auto qprops = vk.physical_device.getQueueFamilyProperties();
+		if (vk.queue_family_index < qprops.size())
+			timestamp_supported = qprops[vk.queue_family_index].timestampValidBits > 0;
+		if (timestamp_supported)
+		{
+			timestamp_pool = vk.device.createQueryPool(vk::QueryPoolCreateInfo{
+			        .queryType = vk::QueryType::eTimestamp,
+			        .queryCount = num_slots * 2,
+			});
+			vk.name(timestamp_pool, std::format("va encoder {} timestamp pool", stream_idx));
+		}
+	}
 }
 
-void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t)
+void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
@@ -467,6 +486,13 @@ void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, 
 
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+	if (*timestamp_pool)
+	{
+		cmd.resetQueryPool(*timestamp_pool, slot * 2, 2);
+		cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe,
+		                    *timestamp_pool, slot * 2);
+	}
 
 	cmd.pipelineBarrier(
 	        vk::PipelineStageFlagBits::eAllCommands,
@@ -534,6 +560,10 @@ void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, 
 	        nullptr,
 	        im_barriers);
 
+	if (*timestamp_pool)
+		cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllTransfer,
+		                    *timestamp_pool, slot * 2 + 1);
+
 	cmd.end();
 
 	std::unique_lock lock(vk.queue_mutex);
@@ -541,6 +571,8 @@ void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, 
 	        .commandBuffer = *cmd,
 	};
 
+	in[slot].pending_frame_index = frame_index;
+	in[slot].copy_submit_ns = os_monotonic_get_ns();
 	vk.device.resetFences(*in[slot].fence);
 	vk.queue.submit2(vk::SubmitInfo2{
 	                         .commandBufferInfoCount = 1,
@@ -553,6 +585,24 @@ void video_encoder_va::push_frame(bool idr, uint8_t slot)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 		throw std::runtime_error("timeout");
+
+	if (*timestamp_pool)
+	{
+		auto [tres, ts] = timestamp_pool.getResults<uint64_t>(
+		        slot * 2, 2,
+		        2 * sizeof(uint64_t), sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (tres == vk::Result::eSuccess and ts[1] >= ts[0])
+		{
+			const int64_t copy_duration_ns = static_cast<int64_t>((ts[1] - ts[0]) * timestamp_period_ns);
+			const int64_t gpu_begin = in[slot].copy_submit_ns;
+			wivrn::trace::gpu_slice(wivrn::trace::gpu_track::va_copy,
+			                        "vk_copy_luma_chroma",
+			                        gpu_begin, gpu_begin + copy_duration_ns,
+			                        in[slot].pending_frame_index, stream_idx);
+		}
+	}
+
 	auto & va_frame = in[slot].va_frame;
 	va_frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
 	int err = avcodec_send_frame(encoder_ctx.get(), va_frame.get());

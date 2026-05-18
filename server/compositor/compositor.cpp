@@ -35,6 +35,7 @@
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
 #include "utils/method.h"
+#include "utils/wivrn_trace.h"
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
@@ -624,9 +625,11 @@ void compositor::encoder_work(std::stop_token tok)
 		if (req < 0)
 		{
 			encode_request.wait(req);
+			WIVRN_TRACE_INSTANT(compositor, "encoder_work wake");
 			continue;
 		}
 
+		WIVRN_TRACE_SCOPE(compositor, "encoder_work iter");
 		assert(req < images.size());
 		auto & image = images[req];
 

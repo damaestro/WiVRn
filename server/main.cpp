@@ -9,6 +9,7 @@
 #include "openxr/openxr.h"
 #include "sleep_inhibitor.h"
 #include "util/u_trace_marker.h"
+#include "utils/wivrn_trace.h"
 
 #include "active_runtime.h"
 #include "avahi_publisher.h"
@@ -948,6 +949,14 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 	listen_socket = create_listen_socket();
 
 	u_trace_marker_init();
+	// wivrn::trace::init() is intentionally NOT called here. This is the daemon
+	// parent — it forks per client session and the trace macros only fire from
+	// the per-session child (compositor / encoder / network). Initializing
+	// percetto in the parent would leave the child with a stale producer
+	// connection registered under the parent PID, so traced never enables the
+	// child's categories. Init runs in the child via xrt_instance_create
+	// (target_instance_wivrn.cpp), where std::call_once fires with the child's
+	// own PID and percetto opens a fresh producer socket.
 
 	// Initialize main loop
 	main_loop = g_main_loop_new(nullptr, false);

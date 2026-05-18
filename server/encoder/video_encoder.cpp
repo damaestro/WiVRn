@@ -24,6 +24,7 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
 #include <string>
@@ -234,6 +235,7 @@ void video_encoder::set_framerate(float framerate)
 
 void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
 {
+	WIVRN_TRACE_SCOPE(encoder, "present_image");
 	// Wait for encoder to be done
 	present_slot = (present_slot + 1) % num_slots;
 	state[present_slot].wait(busy);
@@ -250,6 +252,7 @@ void video_encoder::encode(wivrn_session & cnx,
                            const to_headset::video_stream_data_shard::view_info_t & view_info,
                            uint64_t frame_index)
 {
+	WIVRN_TRACE_SCOPE(encoder, "encode");
 	encode_slot = (encode_slot + 1) % num_slots;
 
 	struct idle_setter
@@ -296,6 +299,7 @@ void video_encoder::encode(wivrn_session & cnx,
 
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
 {
+	WIVRN_TRACE_SCOPE(network, "SendData");
 	std::lock_guard lock(mutex);
 	if (end_of_frame)
 	{

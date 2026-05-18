@@ -42,6 +42,9 @@ class video_encoder_vulkan : public video_encoder
 	uint64_t sem_value = 0;
 
 	vk::raii::QueryPool query_pool = nullptr;
+	vk::raii::QueryPool timestamp_pool = nullptr;
+	float timestamp_period_ns = 0.f;
+	bool timestamp_supported = false;
 	vk::raii::CommandPool transfer_command_pool = nullptr;
 	vk::raii::CommandPool video_command_pool = nullptr;
 
@@ -60,6 +63,8 @@ class video_encoder_vulkan : public video_encoder
 		vk::DeviceSize copy_size;
 		bool idr = false;
 		std::atomic<bool> busy = false;
+		uint64_t pending_frame_index = 0;
+		int64_t encode_submit_ns = 0;
 	};
 	std::array<slot_item, num_slots> slot_data;
 

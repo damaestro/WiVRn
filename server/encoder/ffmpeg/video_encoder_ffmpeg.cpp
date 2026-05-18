@@ -19,7 +19,9 @@
 
 #include "video_encoder_ffmpeg.h"
 
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 
 extern "C"
 {
@@ -83,9 +85,15 @@ std::optional<wivrn::video_encoder::data> video_encoder_ffmpeg::encode(uint8_t s
 
 	bool is_idr = idr_handler.get_type(frame_index) == default_idr_handler::frame_type::i;
 
+	const int64_t encode_begin_ns = os_monotonic_get_ns();
 	push_frame(is_idr, slot);
 	std::shared_ptr<AVPacket> enc_pkt(av_packet_alloc(), [](AVPacket * d) { av_packet_free(&d); });
 	int err = avcodec_receive_packet(encoder_ctx.get(), enc_pkt.get());
+	const int64_t encode_end_ns = os_monotonic_get_ns();
+	wivrn::trace::gpu_slice(wivrn::trace::gpu_track::va_encode,
+	                        "avcodec_send+receive",
+	                        encode_begin_ns, encode_end_ns,
+	                        frame_index, stream_idx);
 	if (err == 0)
 	{
 		return data{

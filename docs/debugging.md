@@ -292,6 +292,82 @@ Start with tracing enabled:
 XRT_TRACING=true wivrn-server
 ```
 
+#### Encoder Profiling (Vulkan vs NVENC vs VAAPI)
+
+To compare the Vulkan-video, NVENC, and VAAPI encoder paths on the same
+hardware, build with the WiVRn-native Perfetto integration (via
+[Percetto](https://github.com/olvaffe/percetto)):
+
+```bash
+cmake -B build -DWIVRN_USE_PERFETTO=ON ...
+cmake --build build
+```
+
+This adds CPU spans on the compositor and encoder threads, plus
+GPU-side encode duration as reconstructed slices:
+
+| Category        | Spans / instants                                          |
+| --------------- | --------------------------------------------------------- |
+| `encoder`       | `present_image`, `encode` CPU spans                       |
+| `encoder_gpu`   | `encodeVideoKHR` (Vulkan), `nvEncEncodePicture+Lock` (NVENC), `vk_copy_image_to_buffer` (NVENC pre-copy), `avcodec_send+receive` (VAAPI), `vk_copy_luma_chroma` (VAAPI pre-copy) |
+| `compositor`    | `encoder_work iter`, encoder-thread wake instants         |
+| `network`       | `SendData` CPU spans                                      |
+| `feedback`      | Headset-side `receive_*`, `decode_*`, `blit`, `display` events ferried via `dump_time` |
+
+Each slice carries `frame` and `stream` args so you can pivot per-frame
+across the timeline.
+
+Capture a trace:
+
+```bash
+sudo traced --set-socket-permissions $USER:0660:$USER:0660 &
+perfetto -c tools/perfetto/wivrn_trace_cfg.pbtx --txt -o vulkan.pftrace &
+# In server config, set "encoder_name": "vulkan", then start the server with
+# WiVRn tracing enabled (mirrors Monado's XRT_TRACING gate):
+WIVRN_TRACING=true wivrn-server
+# Reproduce the workload. Stop perfetto when done.
+```
+
+Without `WIVRN_TRACING=true` the build-time `WIVRN_USE_PERFETTO=ON` code
+path stays compiled in but does not open a producer connection — every
+trace macro short-circuits on the category session mask, so there is no
+runtime cost.
+
+Repeat with `"encoder_name": "nvenc"` and `"encoder_name": "vaapi"` to produce
+`nvenc.pftrace` / `vaapi.pftrace`, then open them all in
+[ui.perfetto.dev](https://ui.perfetto.dev) and compare slice durations on the
+`encoder_gpu` track.
+
+##### Coexistence with Monado tracing
+
+WiVRn and Monado tracing are independent at both build time and runtime:
+
+| Build flag | Runtime env var | Effect |
+|---|---|---|
+| `XRT_FEATURE_TRACING=ON` | `XRT_TRACING=true` | Monado emits events. |
+| `WIVRN_USE_PERFETTO=ON` | `WIVRN_TRACING=true` | WiVRn emits events. |
+
+Both use the same [Percetto](https://github.com/olvaffe/percetto) backend
+with disjoint category and track names (`encoder*`/`compositor`/`network`/`feedback`
+and `wivrn_*` tracks vs Monado's `vk`/`comp`/... and `pc_*`/`pa_*` tracks),
+and both initialise percetto on `CLOCK_MONOTONIC`, so explicit-timestamp
+slices line up across both producers.
+
+When both env vars are set, Monado's `u_trace_marker_init` runs first; WiVRn's
+init detects the existing producer and registers its categories via
+`percetto_register_group_category` instead of re-initialising. A single
+captured trace contains events from both.
+
+##### CSV vs Perfetto
+
+`WIVRN_DUMP_TIMINGS=…` (CSV) and `WIVRN_USE_PERFETTO=ON` are orthogonal — set
+either, neither, or both. The CSV schema and event names are unchanged when
+Perfetto is enabled; every CSV row also appears as an instant on the
+`feedback` track at its clock-corrected timestamp. Additional Perfetto-only
+data: CPU scope spans (`encoder/encode`, `compositor/encoder_work iter`, etc.)
+and GPU encode/copy slices reconstructed from query pools and host-bracketed
+NVENC/VAAPI calls.
+
 ---
 
 ## USB Tunneling
@@ -363,7 +439,8 @@ The log is located at `$XDG_STATE_HOME/xrizer/xrizer.txt`, or `$HOME/.local/stat
 | `WIVRN_DUMP_TIMINGS` | Path to dump timing CSV (e.g., `/tmp/wivrn-timings.csv`) |
 | `WIVRN_LOGLEVEL` | Log level for the native client |
 | `WIVRN_AUTOCONNECT` | Auto-connect to the first discovered server |
-| `XRT_TRACING` | Enable Perfetto tracing (`true`/`false`) |
+| `XRT_TRACING` | Enable Monado Perfetto tracing (`true`/`false`) |
+| `WIVRN_TRACING` | Enable WiVRn Perfetto tracing (`true`/`1`/`yes`/`on`). Requires `WIVRN_USE_PERFETTO=ON` at build time. |
 
 ### Vulkan
 

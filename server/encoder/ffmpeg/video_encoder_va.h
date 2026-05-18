@@ -43,9 +43,15 @@ class video_encoder_va : public video_encoder_ffmpeg
 		vk::raii::Image luma = nullptr;
 		vk::raii::Image chroma = nullptr;
 		std::vector<vk::raii::DeviceMemory> mem;
+		uint64_t pending_frame_index = 0;
+		int64_t copy_submit_ns = 0;
 	};
 	av_buffer_ptr drm_frame_ctx;
 	std::array<in_t, num_slots> in;
+
+	vk::raii::QueryPool timestamp_pool = nullptr;
+	float timestamp_period_ns = 0.f;
+	bool timestamp_supported = false;
 
 public:
 	video_encoder_va(wivrn::vk_bundle &, const wivrn::encoder_settings & settings, uint8_t stream_index);

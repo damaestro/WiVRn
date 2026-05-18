@@ -20,7 +20,9 @@
 #include "video_encoder_nvenc.h"
 #include "encoder_settings.h"
 
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
 bool operator==(const GUID & l, const GUID & r)
@@ -410,6 +412,23 @@ video_encoder_nvenc::video_encoder_nvenc(
 		i.nvenc_resource = resource_params.registeredResource;
 	}
 	CU_CHECK(shared_state->cuda_fn->cuCtxPopCurrent(NULL));
+
+	// Vulkan timestamp pool for the Vulkan→CUDA copy step in present_image.
+	{
+		auto props = vk.physical_device.getProperties();
+		timestamp_period_ns = props.limits.timestampPeriod;
+		auto qprops = vk.physical_device.getQueueFamilyProperties();
+		if (vk.queue_family_index < qprops.size())
+			timestamp_supported = qprops[vk.queue_family_index].timestampValidBits > 0;
+		if (timestamp_supported)
+		{
+			timestamp_pool = vk.device.createQueryPool(vk::QueryPoolCreateInfo{
+			        .queryType = vk::QueryType::eTimestamp,
+			        .queryCount = num_slots * 2,
+			});
+			vk.name(timestamp_pool, std::format("nvenc encoder {} timestamp pool", stream_idx));
+		}
+	}
 }
 
 video_encoder_nvenc::~video_encoder_nvenc()
@@ -418,7 +437,7 @@ video_encoder_nvenc::~video_encoder_nvenc()
 		shared_state->fn.nvEncDestroyEncoder(session_handle);
 }
 
-void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t)
+void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
@@ -427,6 +446,13 @@ void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 	}
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+	if (*timestamp_pool)
+	{
+		cmd.resetQueryPool(*timestamp_pool, slot * 2, 2);
+		cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe,
+		                    *timestamp_pool, slot * 2);
+	}
 
 	cmd.copyImageToBuffer(
 	        y_cbcr,
@@ -459,6 +485,9 @@ void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 	                                .depth = 1,
 	                        },
 	                }});
+	if (*timestamp_pool)
+		cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllTransfer,
+		                    *timestamp_pool, slot * 2 + 1);
 	cmd.end();
 
 	std::unique_lock lock(vk.queue_mutex);
@@ -466,6 +495,8 @@ void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 	        .commandBuffer = *cmd,
 	};
 
+	in[slot].pending_frame_index = frame_index;
+	in[slot].copy_submit_ns = os_monotonic_get_ns();
 	vk.device.resetFences(*in[slot].fence);
 	vk.queue.submit2(vk::SubmitInfo2{
 	                         .commandBufferInfoCount = 1,
@@ -480,6 +511,23 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
 		return {};
+	}
+
+	if (*timestamp_pool)
+	{
+		auto [tres, ts] = timestamp_pool.getResults<uint64_t>(
+		        slot * 2, 2,
+		        2 * sizeof(uint64_t), sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (tres == vk::Result::eSuccess and ts[1] >= ts[0])
+		{
+			const int64_t copy_duration_ns = static_cast<int64_t>((ts[1] - ts[0]) * timestamp_period_ns);
+			const int64_t gpu_begin = in[slot].copy_submit_ns;
+			wivrn::trace::gpu_slice(wivrn::trace::gpu_track::nvenc_copy,
+			                        "vk_copy_image_to_buffer",
+			                        gpu_begin, gpu_begin + copy_duration_ns,
+			                        in[slot].pending_frame_index, stream_idx);
+		}
 	}
 
 	CU_CHECK(shared_state->cuda_fn->cuCtxPushCurrent(shared_state->cuda));
@@ -557,6 +605,7 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 			frame_params.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
 			break;
 	}
+	const int64_t nvenc_begin_ns = os_monotonic_get_ns();
 	NVENC_CHECK(shared_state->fn.nvEncEncodePicture(session_handle, &frame_params));
 
 	NV_ENC_LOCK_BITSTREAM buf_lock_params{
@@ -565,6 +614,11 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 	        .outputBitstream = outputBuffer,
 	};
 	NVENC_CHECK(shared_state->fn.nvEncLockBitstream(session_handle, &buf_lock_params));
+	const int64_t nvenc_end_ns = os_monotonic_get_ns();
+	wivrn::trace::gpu_slice(wivrn::trace::gpu_track::nvenc_encode,
+	                        "nvEncEncodePicture+Lock",
+	                        nvenc_begin_ns, nvenc_end_ns,
+	                        frame_index, stream_idx);
 
 	if (buf_lock_params.pictureType == NV_ENC_PIC_TYPE_NONREF_P)
 		idr_handler.set_non_ref(frame_index);

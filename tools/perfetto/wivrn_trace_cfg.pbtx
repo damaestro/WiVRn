@@ -1,0 +1,46 @@
+# Perfetto config for WiVRn server tracing.
+#
+# Usage:
+#   sudo traced --set-socket-permissions $USER:0660:$USER:0660 &
+#   perfetto -c tools/perfetto/wivrn_trace_cfg.pbtx --txt -o trace.pftrace
+#
+# Then run wivrn-server (built with -DWIVRN_USE_PERFETTO=ON), reproduce the
+# workload of interest, and stop the trace.
+#
+# Open trace.pftrace in https://ui.perfetto.dev. The frame_idx / stream / track
+# args attached to each slice/instant let you pivot per-frame across
+# the compositor thread, encoder thread, GPU reconstructed slices, and
+# headset-side feedback events.
+
+duration_ms: 15000
+buffers {
+    size_kb: 65536
+    fill_policy: RING_BUFFER
+}
+
+data_sources {
+    config {
+        name: "track_event"
+        target_buffer: 0
+        track_event_config {
+            enabled_categories: "encoder"
+            enabled_categories: "encoder_gpu"
+            enabled_categories: "compositor"
+            enabled_categories: "network"
+            enabled_categories: "feedback"
+        }
+    }
+}
+
+# Pair host scheduling with our track events to see thread-level context.
+data_sources {
+    config {
+        name: "linux.ftrace"
+        target_buffer: 0
+        ftrace_config {
+            ftrace_events: "sched/sched_switch"
+            ftrace_events: "sched/sched_waking"
+            ftrace_events: "power/cpu_frequency"
+        }
+    }
+}
