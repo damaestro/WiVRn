@@ -140,12 +140,6 @@ wivrn::vk_bundle::vk_bundle() :
         instance(nullptr),
         physical_device(nullptr),
         device(nullptr),
-        queue(nullptr),
-        queue_family_index(vk::QueueFamilyIgnored),
-        transfer_queue(nullptr),
-        transfer_queue_family_index(vk::QueueFamilyIgnored),
-        encode_queue(nullptr),
-        encode_queue_family_index(vk::QueueFamilyIgnored),
         debug(nullptr)
 {
 	// Create instance
@@ -218,14 +212,15 @@ wivrn::vk_bundle::vk_bundle() :
 
 	// Select queue families
 	auto queues = physical_device.getQueueFamilyProperties();
+	uint32_t encode_queue_family_index;
 	{
-		queue_family_index = select_queue(queues, vk::QueueFlagBits::eCompute);
-		transfer_queue_family_index = select_queue(queues, vk::QueueFlagBits::eTransfer);
+		queue.family_index = select_queue(queues, vk::QueueFlagBits::eCompute);
+		transfer_queue.family_index = select_queue(queues, vk::QueueFlagBits::eTransfer);
 #if WIVRN_USE_VULKAN_ENCODE
 		encode_queue_family_index = select_queue(queues, vk::QueueFlagBits::eVideoEncodeKHR);
 #endif
 		// Technically allowed to have a device with only encode or decode capabilities
-		if (queue_family_index == vk::QueueFamilyIgnored)
+		if (queue.family_index == vk::QueueFamilyIgnored)
 			throw std::runtime_error("GPU does not support vulkan compute");
 	}
 
@@ -282,6 +277,9 @@ wivrn::vk_bundle::vk_bundle() :
 #ifdef VK_KHR_maintenance9
 		        VK_KHR_MAINTENANCE_9_EXTENSION_NAME,
 #endif
+#ifdef VK_KHR_unified_image_layouts
+		        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
+#endif
 		};
 		for (auto & ext: physical_device.enumerateDeviceExtensionProperties())
 		{
@@ -292,13 +290,21 @@ wivrn::vk_bundle::vk_bundle() :
 		float prio = 1.0;
 
 		std::vector<vk::DeviceQueueCreateInfo> queues_info;
-		int queue_index = get_queue_index(queues, queues_info, queue_family_index);
+		int queue_index = get_queue_index(queues, queues_info, queue.family_index);
 		U_LOG_D("queue index: %d", queue_index);
-		int transfer_queue_index = get_queue_index(queues, queues_info, transfer_queue_family_index);
+		int transfer_queue_index = get_queue_index(queues, queues_info, transfer_queue.family_index);
 		U_LOG_D("transfer queue index: %d", transfer_queue_index);
 #if WIVRN_USE_VULKAN_ENCODE
-		int encode_queue_index = get_queue_index(queues, queues_info, encode_queue_family_index);
-		U_LOG_D("encode queue index: %d", encode_queue_index);
+		std::vector<int> encode_queue_indices;
+		// Get up to 3 encode queues (left, right and alpha encoders)
+		for (int i = 0; i < 3; ++i)
+		{
+			int encode_queue_index = get_queue_index(queues, queues_info, encode_queue_family_index);
+			if (encode_queue_index < 0)
+				break;
+			U_LOG_D("encode queue index: %d", encode_queue_index);
+			encode_queue_indices.push_back(encode_queue_index);
+		}
 #ifdef VK_KHR_video_maintenance1
 		if (has_device_ext(VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME))
 			std::get<vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>(feat).videoMaintenance1 =
@@ -329,6 +335,16 @@ wivrn::vk_bundle::vk_bundle() :
 		if (has_device_ext(VK_KHR_VIDEO_ENCODE_INTRA_REFRESH_EXTENSION_NAME))
 			std::get<vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR>(feat).videoEncodeIntraRefresh = std::get<vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR>(physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR>()).videoEncodeIntraRefresh;
 #endif
+#ifdef VK_KHR_unified_image_layouts
+		if (has_device_ext(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME))
+		{
+			const auto available = std::get<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>(physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>());
+			auto & enabled = std::get<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>(feat);
+			enabled.unifiedImageLayouts = available.unifiedImageLayouts;
+			enabled.unifiedImageLayoutsVideo = available.unifiedImageLayoutsVideo;
+			U_LOG_D("GPU unified layout support: %d (video: %d)", enabled.unifiedImageLayouts, enabled.unifiedImageLayoutsVideo);
+		}
+#endif
 
 		device = vk::raii::Device(
 		        physical_device,
@@ -340,19 +356,22 @@ wivrn::vk_bundle::vk_bundle() :
 		                .ppEnabledExtensionNames = device_extensions.data(),
 		        });
 
-		queue = device.getQueue(queue_family_index, queue_index);
-		name(queue, "compute queue");
+		queue.queue = device.getQueue(queue.family_index, queue_index);
+		name(queue.queue, "compute queue");
 		if (transfer_queue_index >= 0)
 		{
-			transfer_queue = device.getQueue(transfer_queue_family_index, transfer_queue_index);
-			name(transfer_queue, "transfer queue");
+			transfer_queue.queue = device.getQueue(transfer_queue.family_index, transfer_queue_index);
+			name(transfer_queue.queue, "transfer queue");
 		}
 #if WIVRN_USE_VULKAN_ENCODE
-		if (encode_queue_index >= 0)
+		for (auto encode_queue_index: encode_queue_indices)
 		{
-			encode_queue = device.getQueue(encode_queue_family_index, encode_queue_index);
-			name(encode_queue, "encode queue");
+			auto & queue = encode_queues.emplace_back();
+			queue.queue = device.getQueue(encode_queue_family_index, encode_queue_index);
+			queue.family_index = encode_queue_family_index;
+			name(queue.queue, "encode queue");
 		}
+		U_LOG_D("Using %d vulkan encode queue(s)", int(encode_queues.size()));
 #endif
 	}
 
@@ -369,9 +388,9 @@ wivrn::vk_bundle::vk_bundle() :
 	        "\tGPU: %s\n"
 	        "\tqueue families: %d %d %d (main, encode, transfer)\n",
 	        prop.deviceName.data(),
-	        int32_t(queue_family_index),
+	        int32_t(queue.family_index),
 	        int32_t(encode_queue_family_index),
-	        int32_t(transfer_queue_family_index));
+	        int32_t(transfer_queue.family_index));
 }
 
 uint32_t wivrn::vk_bundle::get_memory_type(uint32_t type_bits, vk::MemoryPropertyFlags memory_props)
