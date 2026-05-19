@@ -573,8 +573,8 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		timestamp_period_ns = props.limits.timestampPeriod;
 		// Need timestamps to be valid on the video-encode queue.
 		auto qprops = vk.physical_device.getQueueFamilyProperties();
-		if (vk.encode_queue_family_index < qprops.size())
-			timestamp_supported = qprops[vk.encode_queue_family_index].timestampValidBits > 0;
+		if (encode_queue.family_index < qprops.size())
+			timestamp_supported = qprops[encode_queue.family_index].timestampValidBits > 0;
 		if (timestamp_supported)
 		{
 			timestamp_pool = vk.device.createQueryPool(vk::QueryPoolCreateInfo{

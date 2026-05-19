@@ -418,8 +418,8 @@ video_encoder_nvenc::video_encoder_nvenc(
 		auto props = vk.physical_device.getProperties();
 		timestamp_period_ns = props.limits.timestampPeriod;
 		auto qprops = vk.physical_device.getQueueFamilyProperties();
-		if (vk.queue_family_index < qprops.size())
-			timestamp_supported = qprops[vk.queue_family_index].timestampValidBits > 0;
+		if (vk.queue.family_index < qprops.size())
+			timestamp_supported = qprops[vk.queue.family_index].timestampValidBits > 0;
 		if (timestamp_supported)
 		{
 			timestamp_pool = vk.device.createQueryPool(vk::QueryPoolCreateInfo{
