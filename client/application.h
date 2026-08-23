@@ -25,6 +25,7 @@
 #endif
 
 #include "configuration.h"
+#include "hmd_traits.h"
 #include "utils/singleton.h"
 #include "utils/thread_safe.h"
 #include "vk/vk_allocator.h"
@@ -74,6 +75,7 @@ class application : public singleton<application>
 {
 	friend class scene;
 
+private:
 #ifdef __ANDROID__
 	friend __attribute__((visibility("default"))) void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj);
 #endif
@@ -154,9 +156,11 @@ class application : public singleton<application>
 	std::chrono::nanoseconds last_scene_cpu_time;
 
 	std::optional<configuration> config;
+	std::optional<configuration> default_config;
 
 	boost::locale::generator gen;
 	boost::locale::gnu_gettext::messages_info messages_info;
+	hmd_traits runtime_hmd_traits;
 
 private:
 	void loop();
@@ -202,6 +206,11 @@ public:
 	static android_app * native_app()
 	{
 		return instance().app_info.native_app;
+	}
+
+	static android_hid::input_handler & get_input_handler()
+	{
+		return instance().input_handler;
 	}
 #endif
 
@@ -402,6 +411,12 @@ public:
 		return instance().openxr_post_processing_supported;
 	}
 
+	static const hmd_traits & get_hmd_traits()
+	{
+		assert(instance().runtime_hmd_traits.is_initialized());
+		return instance().runtime_hmd_traits;
+	}
+
 	static auto & get_generic_trackers()
 	{
 		return instance().generic_trackers;
@@ -416,6 +431,12 @@ public:
 	{
 		assert(instance().config);
 		return *instance().config;
+	}
+
+	static configuration & get_default_config()
+	{
+		assert(instance().default_config);
+		return *instance().default_config;
 	}
 
 	static XrSessionState get_session_state()

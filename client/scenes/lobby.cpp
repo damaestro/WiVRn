@@ -23,7 +23,6 @@
 #include "constants.h"
 #include "glm/geometric.hpp"
 #include "hand_model.h"
-#include "hardware.h"
 #include "imgui.h"
 #include "openxr/openxr.h"
 #include "protocol_version.h"
@@ -122,24 +121,19 @@ static glm::quat compute_gui_orientation(glm::vec3 head_position, glm::vec3 new_
 
 void scenes::lobby::move_gui(glm::vec3 head_position, glm::vec3 new_gui_position)
 {
+	using constants::gui::popup_position;
 	using constants::lobby::keyboard_pitch;
 	using constants::lobby::keyboard_position;
-	using constants::lobby::popup_position;
 
 	auto q = compute_gui_orientation(head_position, new_gui_position);
-	auto M = glm::mat3_cast(q); // plane-to-world transform
 
 	// Main window
 	imgui_ctx->layers()[0].position = new_gui_position;
 	imgui_ctx->layers()[0].orientation = q;
 
-	// Popup
-	imgui_ctx->layers()[1].position = new_gui_position + M * popup_position;
-	imgui_ctx->layers()[1].orientation = q;
-
-	// Keyboard
-	imgui_ctx->layers()[2].position = new_gui_position + M * keyboard_position;
-	imgui_ctx->layers()[2].orientation = q * glm::quat(cos(keyboard_pitch / 2), sin(keyboard_pitch / 2), 0, 0);
+	// Popup and keyboard track the main window
+	imgui_ctx->place_layer_relative(1, 0, popup_position);
+	imgui_ctx->place_layer_relative(2, 0, keyboard_position, glm::quat(cos(keyboard_pitch / 2), sin(keyboard_pitch / 2), 0, 0));
 }
 
 scenes::lobby::lobby() :
@@ -170,6 +164,8 @@ scenes::lobby::lobby() :
 	}
 
 	keyboard.set_layout(config.virtual_keyboard_layout);
+
+	apply_theme_settings();
 
 	if (config.first_run)
 		current_tab = tab::first_run;
@@ -868,6 +864,8 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	if (next_scene)
 	{
+		server_hid_forwarding = next_scene->hid_forwarding_enabled();
+
 		switch (next_scene->current_state())
 		{
 			case scenes::stream::state::streaming:
@@ -1065,20 +1063,14 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	if (composition_layer_depth_test_supported)
 		set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
 
-	bool dim_gui = imgui_ctx->is_modal_popup_shown() and composition_layer_color_scale_bias_supported;
 	for (auto & [z_index, layer]: imgui_layers)
 	{
 		if (z_index < constants::lobby::zindex_recenter_tip)
 		{
 			add_quad_layer(layer.layerFlags, layer.space, layer.eyeVisibility, layer.subImage, layer.pose, layer.size);
 
-			if (dim_gui)
-				set_color_scale_bias(constants::lobby::dimming_scale, constants::lobby::dimming_bias);
-
 			if (composition_layer_depth_test_supported)
 				set_depth_test(true, XR_COMPARE_OP_LESS_OR_EQUAL_FB);
-
-			dim_gui = false; // Only dim the main window
 		}
 	}
 
@@ -1114,7 +1106,7 @@ void scenes::lobby::on_focused()
 
 	auto views = system.view_configuration_views(viewconfig);
 	assert(views.size() == 2); // FIXME
-	stream_view = override_view(views[0], guess_model());
+	stream_view = application::get_hmd_traits().override_view(views[0]);
 	width = views[0].recommendedImageRectWidth;
 	height = views[0].recommendedImageRectHeight;
 
@@ -1130,12 +1122,12 @@ void scenes::lobby::on_focused()
 	catch (std::exception & e)
 	{
 		spdlog::warn("Cannot load environment from {}: {}, reverting to default", config.environment_model, e.what());
-		config.environment_model = configuration{}.environment_model;
+		config.environment_model = application::get_default_config().environment_model;
 		lobby_entity = add_gltf(config.environment_model, layer_lobby).first;
 		config.save();
 	}
 
-	std::string profile = controller_name();
+	const auto & profile = application::get_hmd_traits().controller_profile;
 	input.emplace(
 	        *this,
 	        "assets://controllers/" + profile + "/profile.json",
@@ -1148,7 +1140,7 @@ void scenes::lobby::on_focused()
 
 	for (auto i: {xr::spaces::aim_left, xr::spaces::aim_right, xr::spaces::grip_left, xr::spaces::grip_right})
 	{
-		auto [p, q] = input->offset[i] = controller_offset(controller_name(), i);
+		auto [p, q] = input->offset[i] = application::get_hmd_traits().controller_offset(i);
 
 		auto rot = glm::degrees(glm::eulerAngles(q));
 		spdlog::info("Initializing offset of space {} to ({}, {}, {}) mm, ({}, {}, {})°",
@@ -1177,8 +1169,25 @@ void scenes::lobby::on_focused()
 	{
 		left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
 		right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
-		hand_model::add_hand(*this, XR_HAND_LEFT_EXT, "assets://left-hand.glb", layer_controllers);
-		hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, "assets://right-hand.glb", layer_controllers);
+
+		bool using_hand_mesh_fb = false;
+		if (system.hand_mesh_fb_supported())
+		{
+			const auto * left_hand_mesh_fb = left_hand->mesh();
+			const auto * right_hand_mesh_fb = right_hand->mesh();
+			if (left_hand_mesh_fb and right_hand_mesh_fb)
+			{
+				hand_model::add_hand(*this, XR_HAND_LEFT_EXT, *left_hand_mesh_fb, layer_controllers);
+				hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, *right_hand_mesh_fb, layer_controllers);
+				using_hand_mesh_fb = true;
+			}
+		}
+
+		if (!using_hand_mesh_fb)
+		{
+			hand_model::add_hand(*this, XR_HAND_LEFT_EXT, "assets://left-hand.glb", layer_controllers);
+			hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, "assets://right-hand.glb", layer_controllers);
+		}
 	}
 
 	std::vector imgui_inputs{
@@ -1314,7 +1323,7 @@ void scenes::lobby::on_focused()
 	                .gltf_url = "default",
 	                .builtin = true,
 	                .override_order = -1,
-	                .local_gltf_path = configuration{}.environment_model,
+	                .local_gltf_path = application::get_default_config().environment_model,
 	                .screenshot = imgui_ctx->load_texture("assets://default-environment.ktx2")});
 
 	std::ranges::sort(local_environments, std::less{});
@@ -1402,6 +1411,7 @@ scene::meta & scenes::lobby::get_meta_scene()
 	                                "/interaction_profiles/bytedance/pico_neo3_controller",
 	                                "/interaction_profiles/bytedance/pico4_controller",
 	                                "/interaction_profiles/bytedance/pico4s_controller",
+	                                "/interaction_profiles/yvr/touch_controller_yvr",
 	                                "/interaction_profiles/htc/vive_focus3_controller",
 	                        },
 	                        {

@@ -23,11 +23,18 @@ include(FetchContent)
 include(ExternalProject)
 include(GNUInstallDirs)
 
+set(GIT_TAG "" CACHE STRING "Build for a tag (from git if empty)")
+set(GIT_DESC "" CACHE STRING "Version to show in UI (from git if empty, exclusive with GIT_TAG)")
+set(GIT_COMMIT "" CACHE STRING "Git SHA used to fetch client APK (from git if empty, exclusive with GIT_TAG)")
+
+if (GIT_TAG AND (GIT_DESC OR GIT_COMMIT))
+	message(FATAL_ERROR "cannot use GIT_DESC or GIT_COMMIT when using GIT_TAG")
+endif()
+
 option(WIVRN_USE_SYSTEM_FREETYPE "Use system FreeType" ON)
 option(WIVRN_USE_SYSTEM_BOOST "Use system Boost headers" ON)
 option(WIVRN_USE_SYSTEM_OPENXR "Use system OpenXR headers" ON)
 option(WIVRN_USE_SYSTEM_LIBKTX "Use system KTX-Software library" ON)
-option(WIVRN_USE_SYSTEMD "Use libsystemd" ON)
 option(WIVRN_COMPRESS_GLB "Compress textures in GLB files with gltf-transform" OFF)
 option(WIVRN_USE_ANDROID_VALIDATION_LAYER "Download the android version of the Vulkan validation layer" OFF)
 option(WIVRN_USE_ANDROID_BIN_LIBKTX "Download the prebuilt libktx for android" OFF)
@@ -51,10 +58,15 @@ option(WIVRN_USE_VAAPI "Enable vaapi (AMD/Intel) hardware encoder" ON)
 option(WIVRN_USE_VULKAN_ENCODE "Enable vulkan video encoder" ON)
 option(WIVRN_USE_X264 "Enable x264 software encoder" ON)
 
-option(WIVRN_USE_PIPEWIRE "Enable pipewire backend" ON)
-option(WIVRN_USE_PULSEAUDIO "Enable pulseaudio backend" OFF)
+option(WIVRN_USE_PERFETTO "Enable Perfetto tracing via the Perfetto SDK (server only)" OFF)
+option(WIVRN_TRACE_MONADO "Also instrument Monado (percetto) under the same WIVRN_TRACING switch; pulls in a second Perfetto runtime, system backend only. Requires WIVRN_USE_PERFETTO" OFF)
+if(WIVRN_TRACE_MONADO AND NOT WIVRN_USE_PERFETTO)
+	message(FATAL_ERROR "WIVRN_TRACE_MONADO=ON requires WIVRN_USE_PERFETTO=ON")
+endif()
 
-set(OVR_COMPAT_SEARCH_PATH "/opt/xrizer:/usr/local/lib/OpenComposite:/usr/lib/OpenComposite:/opt/OpenComposite:/opt/opencomposite"
+option(WIVRN_USE_PIPEWIRE "Enable pipewire backend" ON)
+
+set(OVR_COMPAT_SEARCH_PATH "/opt/xrizer:/usr/local/lib/OpenComposite:/usr/lib/OpenComposite:/opt/OpenComposite:/opt/opencomposite:/opt/VapoR:/usr/local/lib/VapoR"
     CACHE STRING "List of places to search for the OpenVR compatibility layer, separated by :")
 
 option(WIVRN_FEATURE_DEBUG_GUI "Enable Monado debug GUI" OFF)
@@ -101,7 +113,7 @@ endif()
 include(VulkanVersion)
 
 if (WIVRN_USE_SYSTEM_BOOST AND NEED_COMMON)
-    if (WIVRN_BUILD_DISSECTOR)
+    if (WIVRN_BUILD_DISSECTOR OR WIVRN_BUILD_CLIENT)
         find_package(Boost 1.84.0 REQUIRED COMPONENTS locale url iostreams)
     else()
         find_package(Boost 1.75.0 REQUIRED COMPONENTS locale url iostreams)
@@ -110,8 +122,8 @@ endif()
 
 if (WIVRN_BUILD_SERVER)
     find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
-    if (Vulkan_VERSION  VERSION_LESS "1.3.261")
-        message(FATAL_ERROR "Vulkan version must be at least 1.3.261, found ${Vulkan_VERSION}")
+    if (Vulkan_VERSION  VERSION_LESS "1.4.304")
+        message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
     endif()
 
     if (NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
@@ -123,26 +135,12 @@ if (WIVRN_BUILD_SERVER)
         pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
     endif()
 
-    if (WIVRN_USE_VULKAN_ENCODE)
-        if (Vulkan_VERSION VERSION_LESS 1.3.283)
-            message(FATAL_ERROR "Vulkan video encode requires 1.3.283, found ${Vulkan_VERSION}")
-        endif()
-    endif()
-
     if (WIVRN_USE_X264)
         pkg_check_modules(X264 REQUIRED IMPORTED_TARGET x264)
     endif()
 
-    if (WIVRN_USE_SYSTEMD)
-        pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
-    endif()
-
     if (WIVRN_USE_PIPEWIRE)
         pkg_check_modules(libpipewire REQUIRED IMPORTED_TARGET libpipewire-0.3)
-    endif()
-
-    if (WIVRN_USE_PULSEAUDIO)
-        pkg_check_modules(libpulse REQUIRED IMPORTED_TARGET libpulse)
     endif()
 
     pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
@@ -185,7 +183,7 @@ endif()
 
 if (WIVRN_BUILD_CLIENT)
     find_program(RSVG_CONVERT rsvg-convert REQUIRED)
-    find_program(TOKTX toktx REQUIRED)
+    find_program(KTX ktx REQUIRED)
 
     if (WIVRN_COMPRESS_GLB)
         find_program(GLTF_TRANSFORM gltf-transform REQUIRED)
@@ -201,7 +199,7 @@ if (WIVRN_BUILD_CLIENT AND NOT ANDROID)
     find_package(Fontconfig REQUIRED)
 
     if (WIVRN_USE_SYSTEM_OPENXR)
-        find_package(OpenXR 1.1.53 REQUIRED)
+        find_package(OpenXR 1.1.58 REQUIRED)
     endif()
 
     if (WIVRN_USE_SYSTEM_LIBKTX)
@@ -239,8 +237,8 @@ FetchContent_Declare(fastgltf      EXCLUDE_FROM_ALL SYSTEM URL https://github.co
                                    URL_HASH SHA256=0bb564e127b14c22f062db50f89381dd2e0a20dbaf4987ca138a4ae8728712f9)
 FetchContent_Declare(glm           EXCLUDE_FROM_ALL SYSTEM URL https://github.com/g-truc/glm/releases/download/1.0.2/glm-1.0.2.zip
                                    URL_HASH SHA256=77fff075c5ab0caf076fade41558c5458d9a242aba2b2076bb72008bdb51a35e)
-FetchContent_Declare(openxr_loader EXCLUDE_FROM_ALL SYSTEM URL https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.54.tar.gz
-                                   URL_HASH SHA256=2055688081066e37238be996534f349420ac52ed34f8514836704232121ee7f3)
+FetchContent_Declare(openxr_loader EXCLUDE_FROM_ALL SYSTEM URL https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.58.tar.gz
+                                   URL_HASH SHA256=815b933219c398314366c289221526428418d799205a73a9640c97ca4242602b)
 FetchContent_Declare(spdlog        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/gabime/spdlog/archive/refs/tags/v1.16.0.tar.gz
                                    URL_HASH SHA256=8741753e488a78dd0d0024c980e1fb5b5c85888447e309d9cb9d949bdb52aa3e)
 FetchContent_Declare(stb           EXCLUDE_FROM_ALL SYSTEM URL https://github.com/nothings/stb/archive/013ac3beddff3dbffafd5177e7972067cd2b5083.zip
@@ -250,17 +248,17 @@ set(KTX_VERSION_FULL "v${KTX_VERSION}")
 FetchContent_Declare(libktx        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/KhronosGroup/KTX-Software/archive/refs/tags/${KTX_VERSION_FULL}.tar.gz
                                    URL_HASH SHA256=9412cb45045a503005acd47d98f9e8b47154634a50b4df21e17a1dfa8971d323
                                    )
-FetchContent_Declare(implot        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/epezent/implot/archive/3da8bd34299965d3b0ab124df743fe3e076fa222.zip
-                                   URL_HASH SHA256=e9b439a94aa6f09fcf12ed9c2cd784efe5e99e96242122aa683e690b29f7a59f)
+FetchContent_Declare(implot        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/epezent/implot/releases/download/v1.0/implot-v1.0.tar.gz
+                                   URL_HASH SHA256=20ca14d5a46f36a650746096c74eba8bea99c9432cd3c877343b96b17a6ae566)
 file(GLOB IMGUI_PATCHES CONFIGURE_DEPENDS patches/imgui/*)
-FetchContent_Declare(imgui         EXCLUDE_FROM_ALL SYSTEM URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.5.tar.gz
-                                   URL_HASH SHA256=0eb50fe9aeba1a51f96b5843c7f630a32ed2e9362d693c61b87e4fa870cf826d
+FetchContent_Declare(imgui         EXCLUDE_FROM_ALL SYSTEM URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9.tar.gz
+                                   URL_HASH SHA256=af97ed649182c39314320514a672b82008ab462b9293fe23d37b30bfa5d05519
                                    PATCH_COMMAND    ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${IMGUI_PATCHES}
 )
 FetchContent_Declare(uni-algo      EXCLUDE_FROM_ALL SYSTEM URL https://github.com/uni-algo/uni-algo/archive/v1.2.0.tar.gz
                                    URL_HASH SHA256=f2a1539cd8635bc6088d05144a73ecfe7b4d74ee0361fabed6f87f9f19e74ca9)
-FetchContent_Declare(entt          EXCLUDE_FROM_ALL SYSTEM URL https://github.com/skypjack/entt/archive/refs/tags/v3.16.0.tar.gz
-                                   URL_HASH SHA256=7d7b4037b737992342049ffab14f22fa10243e01664f8c3a0657aa247ac52f71)
+FetchContent_Declare(entt          EXCLUDE_FROM_ALL SYSTEM URL https://github.com/skypjack/entt/archive/refs/tags/v4.0.0.tar.gz
+                                   URL_HASH SHA256=32a2ff2c72cb047dfd57306006ef238820b70da7c6ce4e7e8a507ac63365212e)
 FetchContent_Declare(curl          EXCLUDE_FROM_ALL SYSTEM URL https://github.com/curl/curl/releases/download/curl-8_17_0/curl-8.17.0.tar.xz
                                    URL_HASH SHA256=955f6e729ad6b3566260e8fef68620e76ba3c31acf0a18524416a185acf77992)
 FetchContent_Declare(spirv-reflect EXCLUDE_FROM_ALL SYSTEM URL https://github.com/KhronosGroup/SPIRV-Reflect/archive/refs/tags/vulkan-sdk-1.4.328.1.tar.gz
@@ -285,6 +283,7 @@ add_custom_target(wivrn-version ALL
         -D OUTPUT_FILE=${CMAKE_BINARY_DIR}/version.cpp
         -D INPUT_FILE_1=${CMAKE_CURRENT_SOURCE_DIR}/server/u_git_tag.cpp.in
         -D OUTPUT_FILE_1=${CMAKE_BINARY_DIR}/u_git_tag.cpp
+        -D GIT_TAG="${GIT_TAG}"
         -D GIT_DESC="${GIT_DESC}"
         -D GIT_COMMIT="${GIT_COMMIT}"
         -P ${CMAKE_SOURCE_DIR}/cmake/GitVersion.cmake
@@ -302,6 +301,7 @@ if (WIVRN_BUILD_CLIENT)
 endif()
 
 if (WIVRN_BUILD_SERVER OR WIVRN_BUILD_SERVER_LIBRARY)
+    find_package(Python3 REQUIRED Interpreter)
     add_subdirectory(server)
 
     if (WIVRN_BUILD_SERVER)
@@ -313,10 +313,6 @@ if (WIVRN_BUILD_SERVER OR WIVRN_BUILD_SERVER_LIBRARY)
         message(STATUS "")
         message(STATUS "Audio backends:")
         message(STATUS "\tPipewire  : ${WIVRN_USE_PIPEWIRE}")
-        message(STATUS "\tPulseaudio: ${WIVRN_USE_PULSEAUDIO}")
-        message(STATUS "")
-        message(STATUS "Optional features:")
-        message(STATUS "\tsystemd: ${WIVRN_USE_SYSTEMD}")
     endif()
 endif()
 

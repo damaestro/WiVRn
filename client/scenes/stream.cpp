@@ -21,6 +21,7 @@
 #include "xr/face_tracker.h"
 #include "xr/fb_face_tracker2.h"
 #include "xr/space.h"
+#include "xr/system.h"
 #include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <magic_enum.hpp>
@@ -33,7 +34,6 @@
 #include "audio/audio.h"
 #include "boost/pfr/core.hpp"
 #include "decoder/shard_accumulator.h"
-#include "hardware.h"
 #include "inplace_vector.hpp"
 #include "spdlog/spdlog.h"
 #include "utils/named_thread.h"
@@ -139,6 +139,27 @@ static const std::unordered_map<std::string, device_id> device_ids = {
 	{"/user/hand/right/input/aim_activate_ext/ready_ext",device_id::RIGHT_AIM_ACTIVATE_READY},
 	{"/user/hand/right/input/grasp_ext/value",      device_id::RIGHT_GRASP_VALUE},
 	{"/user/hand/right/input/grasp_ext/ready_ext",  device_id::RIGHT_GRASP_READY},
+
+	{"/user/gamepad/input/menu/click",             device_id::GAMEPAD_MENU_CLICK},
+	{"/user/gamepad/input/view/click",             device_id::GAMEPAD_VIEW_CLICK},
+	{"/user/gamepad/input/a/click",                device_id::GAMEPAD_A_CLICK},
+	{"/user/gamepad/input/b/click",                device_id::GAMEPAD_B_CLICK},
+	{"/user/gamepad/input/x/click",                device_id::GAMEPAD_X_CLICK},
+	{"/user/gamepad/input/y/click",                device_id::GAMEPAD_Y_CLICK},
+	{"/user/gamepad/input/dpad_down/click",        device_id::GAMEPAD_DPAD_DOWN_CLICK},
+	{"/user/gamepad/input/dpad_right/click",       device_id::GAMEPAD_DPAD_RIGHT_CLICK},
+	{"/user/gamepad/input/dpad_up/click",          device_id::GAMEPAD_DPAD_UP_CLICK},
+	{"/user/gamepad/input/dpad_left/click",        device_id::GAMEPAD_DPAD_LEFT_CLICK},
+	{"/user/gamepad/input/shoulder_left/click",    device_id::GAMEPAD_SHOULDER_LEFT_CLICK},
+	{"/user/gamepad/input/shoulder_right/click",   device_id::GAMEPAD_SHOULDER_RIGHT_CLICK},
+	{"/user/gamepad/input/thumbstick_left/click",  device_id::GAMEPAD_THUMBSTICK_LEFT_CLICK},
+	{"/user/gamepad/input/thumbstick_right/click", device_id::GAMEPAD_THUMBSTICK_RIGHT_CLICK},
+	{"/user/gamepad/input/trigger_left/value",     device_id::GAMEPAD_TRIGGER_LEFT_VALUE},
+	{"/user/gamepad/input/trigger_right/value",    device_id::GAMEPAD_TRIGGER_RIGHT_VALUE},
+	{"/user/gamepad/input/thumbstick_left/x",      device_id::GAMEPAD_THUMBSTICK_LEFT_X},
+	{"/user/gamepad/input/thumbstick_left/y",      device_id::GAMEPAD_THUMBSTICK_LEFT_Y},
+	{"/user/gamepad/input/thumbstick_right/x",     device_id::GAMEPAD_THUMBSTICK_RIGHT_X},
+	{"/user/gamepad/input/thumbstick_right/y",     device_id::GAMEPAD_THUMBSTICK_RIGHT_Y},
 };
 // clang-format on
 
@@ -217,7 +238,7 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 
 		{
 			auto view = self->system.view_configuration_views(self->viewconfig)[0];
-			view = override_view(view, guess_model());
+			view = application::get_hmd_traits().override_view(view);
 
 			info.render_eye_width = view.recommendedImageRectWidth * config.resolution_scale;
 			info.render_eye_height = view.recommendedImageRectHeight * config.resolution_scale;
@@ -245,6 +266,8 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 		}
 
 		info.settings.bitrate_bps = config.bitrate_bps;
+		info.settings.mirror_gamepad = config.forward_gamepad;
+		info.settings.enabled_body_parts = config.body_part_mask;
 
 		info.hand_tracking = config.check_feature(feature::hand_tracking);
 		info.eye_gaze = config.check_feature(feature::eye_gaze);
@@ -274,21 +297,25 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 			}
 		}
 
-		info.num_generic_trackers = 0;
 		if (config.check_feature(feature::body_tracking))
 		{
 			switch (self->system.body_tracker_supported())
 			{
 				case xr::body_tracker_type::none:
+					info.body_tracking = from_headset::body_type::none;
 					break;
 				case xr::body_tracker_type::fb:
-					info.num_generic_trackers = xr::fb_body_tracker::get_whitelisted_joints(config.fb_lower_body, config.fb_hip).size();
+					info.body_tracking = from_headset::body_type::fb;
 					break;
-				case xr::body_tracker_type::htc:
-					info.num_generic_trackers = application::get_generic_trackers().size();
+				case xr::body_tracker_type::meta:
+					info.body_tracking = from_headset::body_type::meta;
 					break;
 				case xr::body_tracker_type::pico:
-					info.num_generic_trackers = xr::pico_body_tracker::joint_whitelist.size();
+					info.body_tracking = from_headset::body_type::bd;
+					break;
+				case xr::body_tracker_type::htc:
+					info.body_tracking = from_headset::body_type::htc;
+					info.num_generic_trackers = application::get_generic_trackers().size();
 					break;
 			}
 		}
@@ -381,7 +408,12 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	             std::tuple(device_id::LEFT_THUMB_HAPTIC, "/user/hand/left", "/output/haptic_thumb"),
 	             std::tuple(device_id::RIGHT_THUMB_HAPTIC, "/user/hand/right", "/output/haptic_thumb"),
 	             std::tuple(device_id::LEFT_THUMB_HAPTIC, "/user/hand/left", "/output/haptic_thumb_fb"),
-	             std::tuple(device_id::RIGHT_THUMB_HAPTIC, "/user/hand/right", "/output/haptic_thumb_fb")})
+	             std::tuple(device_id::RIGHT_THUMB_HAPTIC, "/user/hand/right", "/output/haptic_thumb_fb"),
+
+	             std::tuple(device_id::GAMEPAD_HAPTIC_LEFT, "/user/gamepad", "/output/haptic_left"),
+	             std::tuple(device_id::GAMEPAD_HAPTIC_RIGHT, "/user/gamepad", "/output/haptic_right"),
+	             std::tuple(device_id::GAMEPAD_HAPTIC_LEFT_TRIGGER, "/user/gamepad", "/output/haptic_left_trigger"),
+	             std::tuple(device_id::GAMEPAD_HAPTIC_RIGHT_TRIGGER, "/user/gamepad", "/output/haptic_right_trigger")})
 	{
 		if (auto action = application::get_action(std::string(path) + output); action.first)
 		{
@@ -421,7 +453,7 @@ void scenes::stream::on_focused()
 {
 	gui_status_last_change = instance.now();
 
-	std::string profile = controller_name();
+	const auto & profile = application::get_hmd_traits().controller_profile;
 	input.emplace(
 	        *this,
 	        "assets://controllers/" + profile + "/profile.json",
@@ -434,7 +466,7 @@ void scenes::stream::on_focused()
 
 	for (auto i: {xr::spaces::aim_left, xr::spaces::aim_right, xr::spaces::grip_left, xr::spaces::grip_right})
 	{
-		auto [p, q] = input->offset[i] = controller_offset(controller_name(), i);
+		auto [p, q] = input->offset[i] = application::get_hmd_traits().controller_offset(i);
 
 		auto rot = glm::degrees(glm::eulerAngles(q));
 		spdlog::info("Initializing offset of space {} to ({}, {}, {}) mm, ({}, {}, {})°",
@@ -471,11 +503,12 @@ void scenes::stream::on_focused()
 	        session,
 	        device,
 	        swapchain_format,
-	        1800,
+	        3600,
 	        1200);
 
 	std::vector<imgui_context::viewport> vps{
 	        {
+	                // Main window
 	                .space = xr::spaces::world,
 	                // Position and orientation are set at each frame
 	                .size = {1.2, 0.6666},
@@ -489,6 +522,13 @@ void scenes::stream::on_focused()
 	                .vp_size = {1800, 200},
 	                .tooltip_viewport = true,
 	        },
+	        {
+	                // popup window for combos and modals, tracks the main panel each frame at the same pixel density
+	                .space = xr::spaces::world,
+	                .size = {1.2, 0.6666},
+	                .vp_origin = {1800, 0},
+	                .vp_size = {1800, 1000},
+	        },
 	};
 
 	imgui_ctx.emplace(physical_device,
@@ -500,13 +540,30 @@ void scenes::stream::on_focused()
 	                  std::move(vps),
 	                  image_cache);
 
-	if (application::get_config().enable_stream_gui)
+	// match the lobby's seasonal wordmark logo
 	{
-		plots_toggle_1 = get_action("plots_toggle_1").first;
-		plots_toggle_2 = get_action("plots_toggle_2").first;
+		auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+		auto tm = std::localtime(&t);
+		switch (tm->tm_mon)
+		{
+			case 5:
+				wivrn_logo = imgui_ctx->load_texture("assets://wivrn-pride.ktx2");
+				break;
+			case 11:
+				wivrn_logo = imgui_ctx->load_texture("assets://wivrn-christmas.ktx2");
+				break;
+			default:
+				wivrn_logo = imgui_ctx->load_texture("assets://wivrn.ktx2");
+				break;
+		}
 	}
+
+	plots_toggle_1 = get_action("plots_toggle_1").first;
+	plots_toggle_2 = get_action("plots_toggle_2").first;
 	recenter_left = get_action("recenter_left").first;
 	recenter_right = get_action("recenter_right").first;
+	gui_distance_left = get_action("gui_distance_left").first;
+	gui_distance_right = get_action("gui_distance_right").first;
 	settings_adjust = get_action("settings_adjust").first;
 	foveation_distance = get_action("foveation_distance").first;
 	foveation_ok = get_action("foveation_ok").first;
@@ -565,7 +622,7 @@ void scenes::stream::push_blit_handle(shard_accumulator * decoder, std::shared_p
 			std::swap(handle, decoders[stream].latest_frames[handle->feedback.frame_index % decoders[stream].latest_frames.size()]);
 		}
 
-		if (state_ != state::streaming and not(decoders[0].empty() and decoders[1].empty()))
+		if (state_ != state::streaming and not(decoders[0].empty() or decoders[1].empty()))
 		{
 			set_state(state::streaming);
 			spdlog::info("Stream scene ready at t={}", instance.now());
@@ -680,59 +737,29 @@ std::shared_ptr<shard_accumulator::blit_handle> scenes::stream::accumulator_imag
 	return frame;
 }
 
-void scenes::stream::update_gui_position(xr::spaces controller)
+void scenes::stream::update_gui_position(xr::spaces controller, float predicted_display_period)
 {
-	std::optional<std::pair<glm::vec3, glm::quat>> aim;
+	std::optional<std::pair<glm::vec3, glm::quat>> aim = application::locate_controller(
+	        application::space(controller),
+	        application::space(xr::spaces::world),
+	        predicted_display_time);
 
-	switch (guess_model())
-	{
-		case model::pico_4:
-		case model::pico_4s:
-		case model::pico_4_pro:
-		case model::pico_4_enterprise: {
-			// Pico fails to find its controllers within view space, so use the head position in
-			// world space as a reference
-			aim = application::locate_controller(
-			        application::space(controller),
-			        application::space(xr::spaces::world),
-			        predicted_display_time);
-
-			auto head_position = application::locate_controller(application::space(xr::spaces::view),
-			                                                    application::space(xr::spaces::world),
-			                                                    predicted_display_time);
-			if (not aim || not head_position)
-				return;
-
-			aim->first = glm::conjugate(head_position->second) * (aim->first - head_position->first);
-			aim->second = glm::conjugate(head_position->second) * aim->second;
-
-			break;
-		}
-		default:
-			aim = application::locate_controller(
-			        application::space(controller),
-			        application::space(xr::spaces::view),
-			        predicted_display_time);
-
-			if (not aim)
-				return;
-
-			break;
-	}
+	if (not aim)
+		return;
 
 	auto [offset_position, offset_orientation] = input->offset[controller];
 
-	auto head_controller_position = aim->first + glm::mat3_cast(aim->second * offset_orientation) * offset_position;
-	auto head_controller_orientation = aim->second * offset_orientation;
-	auto head_controller_direction = -glm::column(glm::mat3_cast(head_controller_orientation), 2);
+	auto world_controller_position = aim->first + glm::mat3_cast(aim->second * offset_orientation) * offset_position;
+	auto world_controller_orientation = aim->second * offset_orientation;
+	auto world_controller_direction = -glm::column(glm::mat3_cast(world_controller_orientation), 2);
 
 	if (not recentering_context)
 	{
 		// First frame of recentering: get the GUI position relative to the controller
 
 		// Compute the intersection of the ray with the GUI
-		auto gui_controller_direction = glm::conjugate(head_gui_orientation) * head_controller_direction;
-		auto gui_controller_position = glm::conjugate(head_gui_orientation) * (head_controller_position - head_gui_position);
+		auto gui_controller_direction = glm::conjugate(world_gui_orientation) * world_controller_direction;
+		auto gui_controller_position = glm::conjugate(world_gui_orientation) * (world_controller_position - world_gui_position);
 
 		float lambda = -gui_controller_position.z / gui_controller_direction.z;
 		auto gui_intersection = gui_controller_position + lambda * gui_controller_direction;
@@ -747,8 +774,8 @@ void scenes::stream::update_gui_position(xr::spaces controller)
 		}
 		else
 		{
-			glm::vec3 controller_gui_position = glm::conjugate(head_controller_orientation) * (head_gui_position - head_controller_position);
-			glm::quat controller_gui_orientation = glm::conjugate(head_controller_orientation) * head_gui_orientation;
+			glm::vec3 controller_gui_position = glm::conjugate(world_controller_orientation) * (world_gui_position - world_controller_position);
+			glm::quat controller_gui_orientation = glm::conjugate(world_controller_orientation) * world_gui_orientation;
 
 			recentering_context.emplace(controller, controller_gui_position, controller_gui_orientation);
 		}
@@ -756,10 +783,16 @@ void scenes::stream::update_gui_position(xr::spaces controller)
 	else
 	{
 		// Subsequent frames of recentering: keep the GUI locked to the controller
-		auto [_, controller_gui_position, controller_gui_orientation] = *recentering_context;
+		auto & [_, controller_gui_position, controller_gui_orientation] = *recentering_context;
 
-		head_gui_position = head_controller_position + head_controller_orientation * controller_gui_position;
-		head_gui_orientation = head_controller_orientation * controller_gui_orientation;
+		if (auto gui_distance = application::read_action_float(controller == xr::spaces::aim_left ? gui_distance_left : gui_distance_right))
+		{
+			controller_gui_position.z *= std::pow(constants::stream::gui_max_layer_speed, gui_distance->second * predicted_display_period);
+			controller_gui_position.z = -std::clamp<float>(-controller_gui_position.z, constants::stream::gui_min_layer_distance, constants::stream::gui_max_layer_distance);
+		}
+
+		world_gui_position = world_controller_position + world_controller_orientation * controller_gui_position;
+		world_gui_orientation = world_controller_orientation * controller_gui_orientation;
 	}
 }
 
@@ -769,7 +802,6 @@ bool scenes::stream::is_interactable(stream_tab tab)
 	{
 		case stream_tab::stats:
 		case stream_tab::settings:
-		case stream_tab::bitrate_settings:
 		case stream_tab::foveation_settings:
 		case stream_tab::applications:
 		case stream_tab::application_launcher:
@@ -800,7 +832,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	last_display_time = frame_state.predictedDisplayTime;
 
 	std::shared_lock lock(decoder_mutex);
-	if (not frame_state.shouldRender or (decoders[0].empty() and decoders[1].empty()) or state_ == state::shutdown)
+	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
 	{
 		// TODO: stop/restart video stream
 		session.begin_frame();
@@ -822,8 +854,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
 		throw std::runtime_error("Vulkan fence timeout");
-
-	device.resetFences(*fence);
 
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
@@ -876,7 +906,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		auto & blit_handle = current_blit_handles[i];
 		if (not blit_handle)
+		{
+			if (i == view_count)
+				use_alpha = false;
 			continue;
+		}
 
 		blit_handle->feedback.blitted = instance.now();
 		if (blit_handle->feedback.blitted - blit_handle->feedback.received_from_decoder > 1'000'000'000)
@@ -942,159 +976,165 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	XrExtent2Di extents[view_count];
+	// Allow the headset to time warp if we are redisplaying a frame
+	if ((not application::get_hmd_traits().discard_frame) or
+	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
+	    is_gui_interactable())
 	{
-		int32_t max_width = 0;
-		int32_t max_height = 0;
-		for (size_t i = 0; i < view_count; ++i)
+		XrExtent2Di extents[view_count];
 		{
-			extents[i] = stream_defoveator::defoveated_size(foveation[i]);
-			max_width = std::max(max_width, extents[i].width);
-			max_height = std::max(max_height, extents[i].height);
-		}
-		if (not swapchain)
-			setup_reprojection_swapchain(max_width, max_height);
-		else if (swapchain.width() < max_width or swapchain.height() < max_height)
-		{
-			// If the defoveated image is larger than the swapchain, try to reallocate one
-			try
+			int32_t max_width = 0;
+			int32_t max_height = 0;
+			for (size_t i = 0; i < view_count; ++i)
 			{
-				spdlog::info("Recreating swapchain, from {}x{} to {}x{}",
-				             swapchain.width(),
-				             swapchain.height(),
-				             max_width,
-				             max_height);
-				setup_reprojection_swapchain(max_width, max_height);
+				extents[i] = stream_defoveator::defoveated_size(foveation[i]);
+				max_width = std::max(max_width, extents[i].width);
+				max_height = std::max(max_height, extents[i].height);
 			}
-			catch (std::exception & e)
+			if (not swapchain)
+				setup_reprojection_swapchain(max_width, max_height);
+			else if (swapchain.width() < max_width or swapchain.height() < max_height)
 			{
-				spdlog::warn("failed to increase swapchain size");
-				for (size_t i = 0; i < view_count; ++i)
+				// If the defoveated image is larger than the swapchain, try to reallocate one
+				try
 				{
-					extents[i].width = std::min(extents[i].width, swapchain.width());
-					extents[i].height = std::min(extents[i].height, swapchain.height());
+					spdlog::info("Recreating swapchain, from {}x{} to {}x{}",
+					             swapchain.width(),
+					             swapchain.height(),
+					             max_width,
+					             max_height);
+					setup_reprojection_swapchain(max_width, max_height);
+				}
+				catch (std::exception & e)
+				{
+					spdlog::warn("failed to increase swapchain size");
+					for (size_t i = 0; i < view_count; ++i)
+					{
+						extents[i].width = std::min(extents[i].width, swapchain.width());
+						extents[i].height = std::min(extents[i].height, swapchain.height());
+					}
 				}
 			}
 		}
-	}
-	assert(swapchain);
-	// defoveate the image, apply scale/bias
-	int image_index = swapchain.acquire();
-	swapchain.wait();
+		assert(swapchain);
+		// defoveate the image, apply scale/bias
+		int image_index = swapchain.acquire();
+		swapchain.wait();
 
-	switch (gui_status)
-	{
-		case stream_tab::hidden:
-		case stream_tab::bitrate_settings:
-		case stream_tab::foveation_settings:
-		case stream_tab::compact:
-		case stream_tab::overlay_only:
-			dimming = dimming - frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
-			break;
-		case stream_tab::stats:
-		case stream_tab::settings:
-		case stream_tab::applications:
-		case stream_tab::application_launcher:
-			dimming = dimming + frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
-			break;
-	}
-
-	dimming = std::clamp<float>(dimming, 0, 1);
-	float x = dimming * dimming * (3 - 2 * dimming); // Easing function
-
-	const float scale = std::lerp(1, constants::stream::dimming_scale, x);
-	const float bias = std::lerp(0, constants::stream::dimming_bias, x);
-
-	defoveator->defoveate(command_buffer,
-	                      foveation,
-	                      images,
-	                      {scale, scale, scale, 1.},
-	                      {bias, bias, bias, 0.},
-	                      image_index);
-
-	command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
-
-	command_buffer.end();
-	vk::SubmitInfo submit_info;
-	submit_info.setCommandBuffers(*command_buffer);
-
-	inplace_vector<vk::Semaphore, decoder_count> semaphores;
-	inplace_vector<uint64_t, decoder_count> semaphore_vals;
-	inplace_vector<vk::PipelineStageFlags, decoder_count> wait_stages;
-	for (auto b: current_blit_handles)
-	{
-		if (b and b->semaphore)
+		switch (gui_status)
 		{
-			assert(b->semaphore_val);
-			semaphores.push_back(b->semaphore);
-			semaphore_vals.push_back(*b->semaphore_val);
-			wait_stages.push_back(vk::PipelineStageFlagBits::eFragmentShader);
+			case stream_tab::hidden:
+			case stream_tab::foveation_settings:
+			case stream_tab::compact:
+			case stream_tab::overlay_only:
+				dimming = dimming - frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
+				break;
+			case stream_tab::stats:
+			case stream_tab::settings:
+			case stream_tab::applications:
+			case stream_tab::application_launcher:
+				dimming = dimming + frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
+				break;
 		}
-	}
-	submit_info.setWaitDstStageMask(wait_stages);
-	submit_info.setWaitSemaphores(semaphores);
-	vk::TimelineSemaphoreSubmitInfo sem_info{
-	        .waitSemaphoreValueCount = uint32_t(semaphore_vals.size()),
-	        .pWaitSemaphoreValues = semaphore_vals.data(),
-	};
-	submit_info.pNext = &sem_info;
 
-	queue.lock()->submit(submit_info, *fence);
+		dimming = std::clamp<float>(dimming, 0, 1);
+		float x = dimming * dimming * (3 - 2 * dimming); // Easing function
+
+		const float scale = std::lerp(1, constants::stream::dimming_scale, x);
+		const float bias = std::lerp(0, constants::stream::dimming_bias, x);
+
+		defoveator->defoveate(command_buffer,
+		                      foveation,
+		                      images,
+		                      {scale, scale, scale, 1.},
+		                      {bias, bias, bias, 0.},
+		                      image_index);
+
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
+
+		command_buffer.end();
+		vk::SubmitInfo submit_info;
+		submit_info.setCommandBuffers(*command_buffer);
+
+		inplace_vector<vk::Semaphore, decoder_count> semaphores;
+		inplace_vector<uint64_t, decoder_count> semaphore_vals;
+		inplace_vector<vk::PipelineStageFlags, decoder_count> wait_stages;
+		for (auto b: current_blit_handles)
+		{
+			if (b and b->semaphore)
+			{
+				assert(b->semaphore_val);
+				semaphores.push_back(b->semaphore);
+				semaphore_vals.push_back(*b->semaphore_val);
+				wait_stages.push_back(vk::PipelineStageFlagBits::eFragmentShader);
+			}
+		}
+		submit_info.setWaitDstStageMask(wait_stages);
+		submit_info.setWaitSemaphores(semaphores);
+		vk::TimelineSemaphoreSubmitInfo sem_info{
+		        .waitSemaphoreValueCount = uint32_t(semaphore_vals.size()),
+		        .pWaitSemaphoreValues = semaphore_vals.data(),
+		};
+		submit_info.pNext = &sem_info;
+
+		device.resetFences(*fence);
+		queue.lock()->submit(submit_info, *fence);
 #if WIVRN_FEATURE_RENDERDOC
-	renderdoc_end(*vk_instance);
+		renderdoc_end(*vk_instance);
 #endif
-	swapchain.release();
+		swapchain.release();
 
-	if (use_alpha)
-		session.enable_passthrough(system);
-	else
-		session.disable_passthrough();
-
-	render_start(use_alpha, frame_state.predictedDisplayTime);
-
-	// Add the layer with the streamed content
-	std::array<XrCompositionLayerProjectionView, view_count> layer_view;
-	for (uint32_t view = 0; view < view_count; view++)
-	{
-		layer_view[view] =
-		        {
-		                .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-		                .pose = pose[view],
-		                .fov = fov[view],
-
-		                .subImage = {
-		                        .swapchain = swapchain,
-		                        .imageRect = {
-		                                .offset = {0, 0},
-		                                .extent = extents[view],
-		                        },
-		                        .imageArrayIndex = view,
-		                },
-		        };
-	}
-	add_projection_layer(
-	        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
-	        application::space(xr::spaces::world),
-	        layer_view);
-
-	if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
-	    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
-		set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
-
-	accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
-
-	draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
-
-	try
-	{
-		render_end();
-	}
-	catch (std::system_error & e)
-	{
-		if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
-			spdlog::info("Invalid pose submitted");
+		if (use_alpha)
+			session.enable_passthrough(system);
 		else
-			throw;
+			session.disable_passthrough();
+
+		render_start(use_alpha, frame_state.predictedDisplayTime);
+
+		// Add the layer with the streamed content
+		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
+		for (uint32_t view = 0; view < view_count; view++)
+		{
+			layer_view[view] =
+			        {
+			                .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+			                .pose = pose[view],
+			                .fov = fov[view],
+
+			                .subImage = {
+			                        .swapchain = swapchain,
+			                        .imageRect = {
+			                                .offset = {0, 0},
+			                                .extent = extents[view],
+			                        },
+			                        .imageArrayIndex = view,
+			                },
+			        };
+		}
+		add_projection_layer(
+		        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
+		        application::space(xr::spaces::world),
+		        layer_view);
+
+		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
+		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
+			set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
+
+		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
+
+		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+
+		try
+		{
+			render_end();
+		}
+		catch (std::system_error & e)
+		{
+			if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
+				spdlog::info("Invalid pose submitted");
+			else
+				throw;
+		}
 	}
 
 	// Network operations may be blocking, do them once everything was submitted
@@ -1129,7 +1169,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	read_actions();
 
-	if (plots_toggle_1 and plots_toggle_2)
+	if (application::get_config().enable_stream_gui)
 	{
 		XrActionStateGetInfo get_info{
 		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
@@ -1144,7 +1184,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		if (state_1.currentState and state_2.currentState and (state_1.changedSinceLastSync or state_2.changedSinceLastSync))
 		{
-			// Arbitraty transitions can happen from network commands
+			// Arbitrary transitions can happen from network commands
 			// Ensure we can't have a set of 2 non interactable states
 			if (is_gui_interactable())
 				next_gui_status = stream_tab::hidden;
@@ -1165,7 +1205,8 @@ void scenes::stream::exit()
 
 void scenes::stream::setup(const to_headset::video_stream_description & description)
 {
-	session.set_refresh_rate(description.fps);
+	spdlog::info("setup, refresh rate {}", description.refresh_rate);
+	session.set_refresh_rate(description.refresh_rate);
 
 	std::unique_lock lock(decoder_mutex);
 	if (video_stream_description == description)
@@ -1189,7 +1230,8 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	assert(swapchain_width);
 	assert(swapchain_height);
 	device.waitIdle();
-	session.set_refresh_rate(video_stream_description->fps);
+	spdlog::info("swapchain setup, refresh rate {}", video_stream_description->refresh_rate);
+	session.set_refresh_rate(video_stream_description->refresh_rate);
 
 	auto views = system.view_configuration_views(viewconfig);
 
@@ -1233,6 +1275,8 @@ scene::meta & scenes::stream::get_meta_scene()
 
 	                {"recenter_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
 	                {"recenter_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"gui_distance_left", XR_ACTION_TYPE_FLOAT_INPUT},
+	                {"gui_distance_right", XR_ACTION_TYPE_FLOAT_INPUT},
 
 	                {"settings_adjust", XR_ACTION_TYPE_FLOAT_INPUT},
 	                {"foveation_distance", XR_ACTION_TYPE_FLOAT_INPUT},
@@ -1250,6 +1294,7 @@ scene::meta & scenes::stream::get_meta_scene()
 	                                "/interaction_profiles/bytedance/pico_neo3_controller",
 	                                "/interaction_profiles/bytedance/pico4_controller",
 	                                "/interaction_profiles/bytedance/pico4s_controller",
+	                                "/interaction_profiles/yvr/touch_controller_yvr",
 	                                "/interaction_profiles/htc/vive_focus3_controller",
 	                        },
 	                        {
@@ -1266,6 +1311,8 @@ scene::meta & scenes::stream::get_meta_scene()
 
 	                                {"recenter_left", "/user/hand/left/input/squeeze/value"},
 	                                {"recenter_right", "/user/hand/right/input/squeeze/value"},
+	                                {"gui_distance_left", "/user/hand/left/input/thumbstick/y"},
+	                                {"gui_distance_right", "/user/hand/right/input/thumbstick/y"},
 	                                {"settings_adjust", "/user/hand/right/input/thumbstick/y"},
 	                                {"foveation_distance", "/user/hand/left/input/thumbstick/y"},
 	                                {"foveation_ok", "/user/hand/right/input/a/click"},
@@ -1333,6 +1380,7 @@ void scenes::stream::on_xr_event(const xr::event & event)
 		case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT:
 			network_session->send_control(from_headset::user_presence_changed{
 			        .present = (bool)event.user_presence_changed.isUserPresent,
+			        .change_time = instance.now(),
 			});
 			break;
 		case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
@@ -1343,9 +1391,10 @@ void scenes::stream::on_xr_event(const xr::event & event)
 	}
 }
 
-bool scenes::stream::forward_hid_input(from_headset::hid::input_t packet)
+bool scenes::stream::forward_hid_input(from_headset::hid::input_t packet, bool device_enabled)
 {
-	if (not hid_forwarding)
+	// hid_forwarding is whether the server permits it; device_enabled is the headset toggle.
+	if (not hid_forwarding or not device_enabled)
 		return false;
 	network_session->send_control(from_headset::hid::input{packet});
 	return true;
@@ -1353,25 +1402,25 @@ bool scenes::stream::forward_hid_input(from_headset::hid::input_t packet)
 
 bool scenes::stream::on_input_key_down(uint8_t key_code)
 {
-	return forward_hid_input(from_headset::hid::key_down{key_code});
+	return forward_hid_input(from_headset::hid::key_down{key_code}, application::get_config().forward_keyboard);
 }
 bool scenes::stream::on_input_key_up(uint8_t key_code)
 {
-	return forward_hid_input(from_headset::hid::key_up{key_code});
+	return forward_hid_input(from_headset::hid::key_up{key_code}, application::get_config().forward_keyboard);
 }
 bool scenes::stream::on_input_mouse_move(float x, float y)
 {
-	return forward_hid_input(from_headset::hid::mouse_move{x, y});
+	return forward_hid_input(from_headset::hid::mouse_move{x, y}, application::get_config().forward_mouse);
 }
 bool scenes::stream::on_input_button_down(uint8_t button)
 {
-	return forward_hid_input(from_headset::hid::button_down{button});
+	return forward_hid_input(from_headset::hid::button_down{button}, application::get_config().forward_mouse);
 }
 bool scenes::stream::on_input_button_up(uint8_t button)
 {
-	return forward_hid_input(from_headset::hid::button_up{button});
+	return forward_hid_input(from_headset::hid::button_up{button}, application::get_config().forward_mouse);
 }
 bool scenes::stream::on_input_scroll(float h, float v)
 {
-	return forward_hid_input(from_headset::hid::mouse_scroll{h, v});
+	return forward_hid_input(from_headset::hid::mouse_scroll{h, v}, application::get_config().forward_mouse);
 }

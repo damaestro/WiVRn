@@ -189,6 +189,8 @@ configuration::configuration()
 			}
 		}
 
+		// Gates the uinput mirror of forwarded input devices. The OpenXR gamepad needs no
+		// permission, so it is always exposed.
 		if (auto it = json.find("hid-forwarding"); it != json.end())
 			hid_forwarding = *it;
 
@@ -197,6 +199,9 @@ configuration::configuration()
 
 		if (auto it = json.find("use-steamvr-lh"); it != json.end())
 			use_steamvr_lh = *it;
+
+		if (auto it = json.find("lh-stick-deadzone"); it != json.end())
+			lh_stick_deadzone = *it;
 
 		if (auto it = json.find("bit-depth"); it != json.end())
 			bit_depth = *it;

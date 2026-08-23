@@ -35,30 +35,6 @@
 #include "android/battery.h"
 #endif
 
-static uint8_t cast_flags(XrSpaceLocationFlags location, XrSpaceVelocityFlags velocity)
-{
-	uint8_t flags = 0;
-	if (location & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
-		flags |= from_headset::tracking::orientation_valid;
-
-	if (location & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-		flags |= from_headset::tracking::position_valid;
-
-	if (velocity & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
-		flags |= from_headset::tracking::linear_velocity_valid;
-
-	if (velocity & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
-		flags |= from_headset::tracking::angular_velocity_valid;
-
-	if (location & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT)
-		flags |= from_headset::tracking::orientation_tracked;
-
-	if (location & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
-		flags |= from_headset::tracking::position_tracked;
-
-	return flags;
-}
-
 namespace
 {
 
@@ -81,7 +57,7 @@ from_headset::tracking::pose locate_space(device_id device, XrSpace space, XrSpa
 		        .linear_velocity = velocity.linearVelocity,
 		        .angular_velocity = velocity.angularVelocity,
 		        .device = device,
-		        .flags = cast_flags(location.locationFlags, velocity.velocityFlags),
+		        .flags = from_headset::to_pose_flags(location.locationFlags, velocity.velocityFlags),
 		};
 	spdlog::warn("xrLocateSpace failed for {}: {}", magic_enum::enum_name(device), xr::to_string(res));
 	return {.device = device};
@@ -168,7 +144,7 @@ public:
 					        .linear_velocity = velocity.linearVelocity,
 					        .angular_velocity = velocity.angularVelocity,
 					        .device = devices[i],
-					        .flags = cast_flags(location.locationFlags, velocity.velocityFlags),
+					        .flags = from_headset::to_pose_flags(location.locationFlags, velocity.velocityFlags),
 					});
 				}
 			}
@@ -191,31 +167,15 @@ static std::optional<std::array<from_headset::hand_tracking::pose, XR_HAND_JOINT
 		std::array<from_headset::hand_tracking::pose, XR_HAND_JOINT_COUNT_EXT> poses;
 		for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++)
 		{
+			const auto & joint = (*joints)[i];
 			poses[i] = {
-			        .position = (*joints)[i].first.pose.position,
-			        .orientation = pack((*joints)[i].first.pose.orientation),
-			        .linear_velocity = (*joints)[i].second.linearVelocity,
-			        .angular_velocity = (*joints)[i].second.angularVelocity,
-			        .radius = uint16_t((*joints)[i].first.radius * 10'000),
+			        .position = joint.first.pose.position,
+			        .orientation = pack(joint.first.pose.orientation),
+			        .linear_velocity = joint.second.linearVelocity,
+			        .angular_velocity = joint.second.angularVelocity,
+			        .radius = uint16_t(joint.first.radius * 10'000),
+			        .flags = from_headset::to_pose_flags(joint.first.locationFlags, joint.second.velocityFlags),
 			};
-
-			if ((*joints)[i].first.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
-				poses[i].flags |= from_headset::hand_tracking::orientation_valid;
-
-			if ((*joints)[i].first.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-				poses[i].flags |= from_headset::hand_tracking::position_valid;
-
-			if ((*joints)[i].second.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
-				poses[i].flags |= from_headset::hand_tracking::linear_velocity_valid;
-
-			if ((*joints)[i].second.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
-				poses[i].flags |= from_headset::hand_tracking::angular_velocity_valid;
-
-			if ((*joints)[i].first.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT)
-				poses[i].flags |= from_headset::hand_tracking::orientation_tracked;
-
-			if ((*joints)[i].first.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
-				poses[i].flags |= from_headset::hand_tracking::position_tracked;
 		}
 
 		return poses;
@@ -316,7 +276,7 @@ void scenes::stream::tracking()
 	XrTime t0 = instance.now();
 	from_headset::tracking tracking;
 	std::vector<from_headset::hand_tracking> hands;
-	std::vector<from_headset::body_tracking> body;
+	std::vector<std::variant<from_headset::meta_body, from_headset::bd_body, from_headset::htc_body>> body;
 	std::vector<XrView> views;
 
 	std::vector<serialization_packet> packets;
@@ -338,7 +298,7 @@ void scenes::stream::tracking()
 	decltype(to_headset::tracking_control::pattern) pattern;
 	size_t pattern_position = 0;
 
-	XrDuration frame_duration;
+	XrDuration frame_duration{};
 	XrTime pattern_begin = instance.now();
 
 	while (state_ != state::shutdown)
@@ -405,9 +365,7 @@ void scenes::stream::tracking()
 								        instance,
 								        system,
 								        session,
-								        application::get_generic_trackers(),
-								        config.fb_lower_body,
-								        config.fb_hip);
+								        application::get_generic_trackers());
 						}
 						else
 							body_tracker.emplace<std::monostate>();
@@ -443,6 +401,7 @@ void scenes::stream::tracking()
 			tracking.interaction_profiles = {
 			        interaction_profiles[0].load(),
 			        interaction_profiles[1].load(),
+			        interaction_profiles[2].load(),
 			};
 
 			tracking.production_timestamp = t0;
@@ -493,36 +452,31 @@ void scenes::stream::tracking()
 							break;
 						case wivrn::device_id::EYE_GAZE:
 							// Eye gaze uses view pose as the origin
-							switch (guess_model())
+							if (application::get_hmd_traits().view_locate)
+								tracking.device_poses.push_back(locate_space(item.device, spaces[item.device], spaces[wivrn::device_id::HEAD], tracking.timestamp));
+							else
 							{
-								case model::pico_4_pro:
-								case model::pico_4_enterprise: {
-									// Pico headsets fail to locate gaze relative to view
-									auto gaze = locate_space(item.device, spaces[item.device], world_space, tracking.timestamp);
-									auto view_pose = locate_space(item.device, view_space, world_space, tracking.timestamp);
-									glm::quat gaze_quat(gaze.pose.orientation.w, gaze.pose.orientation.x, gaze.pose.orientation.y, gaze.pose.orientation.z);
-									glm::quat view_quat(view_pose.pose.orientation.w, view_pose.pose.orientation.x, view_pose.pose.orientation.y, view_pose.pose.orientation.z);
-									gaze_quat = glm::conjugate(view_quat) * gaze_quat;
-									using flags = from_headset::tracking::flags;
-									tracking.device_poses.push_back(
-									        from_headset::tracking::pose{
-									                // Zero position and velocities
-									                .pose = {
-									                        .orientation = {
-									                                .x = gaze_quat.x,
-									                                .y = gaze_quat.y,
-									                                .z = gaze_quat.z,
-									                                .w = gaze_quat.w,
-									                        },
-									                },
-									                .device = item.device,
-									                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
-									        });
-								}
-								break;
-								default:
-									tracking.device_poses.push_back(locate_space(item.device, spaces[item.device], spaces[wivrn::device_id::HEAD], tracking.timestamp));
-									break;
+								// Pico headsets fail to locate gaze relative to view
+								auto gaze = locate_space(item.device, spaces[item.device], world_space, tracking.timestamp);
+								auto view_pose = locate_space(item.device, view_space, world_space, tracking.timestamp);
+								glm::quat gaze_quat(gaze.pose.orientation.w, gaze.pose.orientation.x, gaze.pose.orientation.y, gaze.pose.orientation.z);
+								glm::quat view_quat(view_pose.pose.orientation.w, view_pose.pose.orientation.x, view_pose.pose.orientation.y, view_pose.pose.orientation.z);
+								gaze_quat = glm::conjugate(view_quat) * gaze_quat;
+								using flags = from_headset::pose_flags;
+								tracking.device_poses.push_back(
+								        from_headset::tracking::pose{
+								                // Zero position and velocities
+								                .pose = {
+								                        .orientation = {
+								                                .x = gaze_quat.x,
+								                                .y = gaze_quat.y,
+								                                .z = gaze_quat.z,
+								                                .w = gaze_quat.w,
+								                        },
+								                },
+								                .device = item.device,
+								                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
+								        });
 							}
 							break;
 						case wivrn::device_id::FACE:
@@ -558,11 +512,10 @@ void scenes::stream::tracking()
 							std::visit(utils::overloaded{
 							                   [](std::monostate &) {},
 							                   [&](auto & b) {
-								                   body.push_back(from_headset::body_tracking{
-								                           .production_timestamp = tracking.production_timestamp,
-								                           .timestamp = at_time,
-								                           .poses = b.locate_spaces(at_time, world_space),
-								                   });
+								                   auto packet = b.locate_spaces(at_time, world_space);
+								                   packet.timestamp = at_time;
+								                   packet.production_timestamp = tracking.production_timestamp;
+								                   body.push_back(packet);
 							                   },
 							           },
 							           body_tracker);
@@ -595,6 +548,18 @@ void scenes::stream::tracking()
 			}
 #endif
 
+			if (auto fb = std::get_if<xr::fb_body_tracker>(&body_tracker); fb and fb->should_send_skeleton())
+			{
+				try
+				{
+					network_session->send_control(fb->get_skeleton());
+				}
+				catch (std::exception & e)
+				{
+					spdlog::warn("Failed to send body skeleton: {}", e.what());
+				}
+			}
+
 			packets.resize(std::max(packets.size(), 1 + hands.size() + body.size()));
 			size_t packet_count = 0;
 
@@ -613,12 +578,14 @@ void scenes::stream::tracking()
 			}
 			for (const auto & i: body)
 			{
-				if (i.poses)
-				{
-					auto & packet = packets[packet_count++];
-					packet.clear();
-					wivrn_session::stream_socket_t::serialize(packet, i);
-				}
+				auto & packet = packets[packet_count++];
+				packet.clear();
+				std::visit(utils::overloaded{
+				                   [&](auto & p) {
+					                   wivrn_session::stream_socket_t::serialize(packet, p);
+				                   },
+				           },
+				           i);
 			}
 
 			network_session->send_stream(std::span(packets.data(), packet_count));
@@ -669,6 +636,7 @@ void scenes::stream::on_interaction_profile_changed(const XrEventDataInteraction
 	std::array path = {
 	        "/user/hand/left",
 	        "/user/hand/right",
+	        "/user/gamepad",
 	};
 #define DO_PROFILE(vendor, name)                                                \
 	if (profile == "/interaction_profiles/" #vendor "/" #name)              \
@@ -677,7 +645,7 @@ void scenes::stream::on_interaction_profile_changed(const XrEventDataInteraction
 		continue;                                                       \
 	}
 
-	for (size_t i = 0; i < 2; ++i)
+	for (size_t i = 0; i < path.size(); ++i)
 	{
 		try
 		{
@@ -705,6 +673,7 @@ void scenes::stream::on_interaction_profile_changed(const XrEventDataInteraction
 			DO_PROFILE(meta, touch_controller_rift_cv1)
 			DO_PROFILE(meta, touch_controller_quest_1_rift_s)
 			DO_PROFILE(meta, touch_controller_quest_2)
+			DO_PROFILE(yvr, touch_controller_yvr)
 			DO_PROFILE(samsung, odyssey_controller)
 			DO_PROFILE(valve, index_controller)
 
@@ -759,43 +728,36 @@ void scenes::stream::send_derived_pose()
 		{
 			// This may happen if the runtime does not support palm ext
 			// check if we have a device specific offset
-			switch (guess_model())
+			if (not application::get_hmd_traits().hand_interaction_grip_surface)
 			{
-				case model::oculus_quest:
-				case model::oculus_quest_2:
-				case model::meta_quest_pro:
-				case model::meta_quest_3:
-				case model::meta_quest_3s:
-					switch (target)
-					{
-						case device_id::LEFT_PALM:
-						case device_id::RIGHT_PALM: {
-							glm::quat q(glm::vec3(glm::radians(-60.), 0, 0));
-							network_session->send_control(from_headset::derived_pose{
-							        .source = source,
-							        .target = target,
-							        .relation = {
-							                .orientation = {
-							                        .x = q.x,
-							                        .y = q.y,
-							                        .z = q.z,
-							                        .w = q.w,
-							                },
-							        },
-							});
-						}
-						break;
-						default:
-							break;
+				switch (target)
+				{
+					case device_id::LEFT_PALM:
+					case device_id::RIGHT_PALM: {
+						glm::quat q(glm::vec3(glm::radians(-60.), 0, 0));
+						network_session->send_control(from_headset::derived_pose{
+						        .source = source,
+						        .target = target,
+						        .relation = {
+						                .orientation = {
+						                        .x = q.x,
+						                        .y = q.y,
+						                        .z = q.z,
+						                        .w = q.w,
+						                },
+						        },
+						});
 					}
-				default:
 					break;
+					default:
+						break;
+				}
 			}
 		}
 		else
 		{
 			if (auto pose = locate_space(target, target_space, source_space, now);
-			    pose.flags & from_headset::tracking::position_valid and pose.flags & from_headset::tracking::orientation_valid)
+			    pose.flags & from_headset::pose_flags::position_valid and pose.flags & from_headset::pose_flags::orientation_valid)
 			{
 				network_session->send_control(from_headset::derived_pose{
 				        .source = source,

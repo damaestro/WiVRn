@@ -19,10 +19,8 @@
 
 #include "stream.h"
 
-#ifdef __ANDROID__
 #include "application.h"
-#endif
-
+#include "utils/i18n.h"
 #include "utils/named_thread.h"
 
 #include <spdlog/spdlog.h>
@@ -87,6 +85,12 @@ void scenes::stream::operator()(to_headset::feature_control && control)
 	{
 		case wivrn::to_headset::feature_control::hid_input:
 			hid_forwarding = control.state;
+			if (not control.state and (application::get_config().forward_keyboard or application::get_config().forward_mouse or application::get_config().forward_gamepad))
+			{
+				auto toast = gui_toast.lock();
+				toast->emplace(_("The server does not allow forwarded input devices"), true);
+				gui_status_last_change = instance.now();
+			}
 			return;
 		case wivrn::to_headset::feature_control::microphone:
 			if (audio_handle)
@@ -94,6 +98,7 @@ void scenes::stream::operator()(to_headset::feature_control && control)
 			return;
 	}
 }
+
 void scenes::stream::operator()(to_headset::audio_stream_description && desc)
 {
 	audio_handle.emplace(desc, *network_session, instance);
@@ -111,10 +116,11 @@ void scenes::stream::operator()(to_headset::video_stream_description && desc)
 
 void scenes::stream::operator()(to_headset::refresh_rate_change && rate)
 {
-	session.set_refresh_rate(rate.fps);
+	spdlog::info("refresh rate change request: {}", rate.hz);
+	session.set_refresh_rate(rate.hz);
 	std::shared_lock lock(decoder_mutex);
 	if (video_stream_description)
-		video_stream_description->fps = rate.fps;
+		video_stream_description->refresh_rate = rate.hz;
 }
 
 void scenes::stream::operator()(to_headset::stream_tab_change && tab)

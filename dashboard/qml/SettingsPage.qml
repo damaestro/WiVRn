@@ -85,7 +85,13 @@ Kirigami.ScrollablePage {
             }
 
             SelectGame {
+                id: select_game
                 Kirigami.FormData.label: i18n("Autostart application:")
+            }
+
+            Controls.CheckBox {
+                id: auto_connect_usb
+                text: i18n("Auto connect from USB")
             }
 
             Kirigami.Separator {
@@ -105,10 +111,10 @@ Kirigami.ScrollablePage {
                 visible: Settings.hid_forwarding_supported
                 Controls.CheckBox {
                     id: hid_forwarding
-                    text: i18n("Forward keyboard & mouse from headset")
+                    text: i18n("Expose forwarded input devices via uinput")
                 }
                 Kirigami.ContextualHelpButton {
-                    toolTipText: i18n("Keyboard and mouse connected to the client will act as if connected to the server. Client OS may reserve specific keys and combinations, which cannot be forwarded.")
+                    toolTipText: i18n("Replicate mouse, keyboard and gamepad connected to the headset as virtual devices on PC.\nReplicated devices will appear as if they were plugged to the PC, some keys may be reserved by the headset OS and not be available. Gamepad is also available without virtual devices for applications that access it through OpenXR.")
                 }
             }
             Controls.CheckBox {
@@ -126,6 +132,26 @@ Kirigami.ScrollablePage {
                     toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
                 }
             }
+            RowLayout {
+                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                Kirigami.FormData.label: i18n("SteamVR joystick deadzone")
+                Controls.Slider {
+                    id: lh_stick_deadzone
+                    Layout.fillWidth: true
+                    from: 0.0
+                    to: 0.9
+                    stepSize: 0.05
+                    value: Settings.lhStickDeadzone
+                }
+                Controls.Label {
+                    text: lh_stick_deadzone.value.toFixed(2)
+                    Layout.preferredWidth: 35
+                    Layout.alignment: Qt.AlignRight
+                }
+                Kirigami.ContextualHelpButton {
+                    toolTipText: i18n("Deadzone to apply to joysticks on lighthouse-tracked controllers, such as Index.\nFor standalone controllers, deadzones may be adjusted via the headset's system settings.")
+                }
+            }
 
             Controls.CheckBox {
                 id: adb_custom
@@ -137,7 +163,7 @@ Kirigami.ScrollablePage {
             Dialogs.FileDialog {
                 id: adb_browse
                 onAccepted: {
-                    adb_location.text = new URL(selectedFile).pathname;
+                    adb_location.text = WivrnServer.host_path(new URL(selectedFile).pathname);
                 }
             }
 
@@ -277,19 +303,26 @@ Kirigami.ScrollablePage {
         }
         DashboardSettings.adb_custom = adb_custom.checked;
         DashboardSettings.adb_location = adb_location.text;
-        Adb.setPath(DashboardSettings.adb_custom.checked ? adb_location.text : "adb");
+        Adb.setPath(adb_custom.checked ? adb_location.text : "adb");
 
         DashboardSettings.show_system_checks = show_system_checks.checked;
 
         Settings.debugGui = debug_gui.checked;
         Settings.steamVrLh = steamvr_lh.checked;
+        Settings.lhStickDeadzone = lh_stick_deadzone.value;
         Settings.hidForwarding = hid_forwarding.checked;
+
+        DashboardSettings.auto_connect_usb = auto_connect_usb.checked;
     }
 
     function load() {
+        select_game.load();
         debug_gui.checked = Settings.debugGui;
         steamvr_lh.checked = Settings.steamVrLh;
+        lh_stick_deadzone.value = Settings.lhStickDeadzone;
         hid_forwarding.checked = Settings.hidForwarding;
+
+        auto_connect_usb.checked = DashboardSettings.auto_connect_usb;
 
         openvr_combobox.load()
 

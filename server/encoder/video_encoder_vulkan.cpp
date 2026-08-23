@@ -20,7 +20,9 @@
 
 #include "encoder/encoder_settings.h"
 #include "inplace_vector.hpp"
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include <iostream>
@@ -164,8 +166,9 @@ wivrn::video_encoder_vulkan::video_encoder_vulkan(
         const vk::VideoEncodeCapabilitiesKHR & in_encode_caps,
         uint8_t stream_idx,
         const encoder_settings & settings) :
-        video_encoder(vk, stream_idx, vk.encode_queue_family_index, settings, std::make_unique<dpb_state>(), true),
+        video_encoder(vk, stream_idx, vk.encode_queues[stream_idx % vk.encode_queues.size()].family_index, settings, std::make_unique<dpb_state>(), true),
         vk(vk),
+        encode_queue(vk.encode_queues[stream_idx % vk.encode_queues.size()]),
         encode_caps(patch_capabilities(in_encode_caps)),
         num_dpb_slots(std::min(video_caps.maxDpbSlots, 16u))
 {
@@ -270,7 +273,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 
 		// NVIDIA has this flag while AMD has mutable flag on images, we don't have to
 		// care for transfer on main queue
-		if (not(vk.physical_device.getQueueFamilyProperties().at(vk.encode_queue_family_index).queueFlags & vk::QueueFlagBits::eTransfer))
+		if (not(vk.physical_device.getQueueFamilyProperties().at(encode_queue.family_index).queueFlags & vk::QueueFlagBits::eTransfer))
 			throw std::runtime_error("Vulkan encode queue is missing transfer capability");
 
 		tmp_image = image_allocation(
@@ -316,6 +319,17 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 			vk.name(item.view, std::format("vulkan encoder {} view {}", stream_idx, i));
 		}
 	}
+
+	// tmp_image path: copyImage source accepts eGeneral, so no transition needed.
+	// Direct path: vkCmdEncodeVideoKHR requires eVideoEncodeSrcKHR — folding it
+	// into target_layout lets the QFOT barrier perform the transition in one step.
+	target_layout = tmp_image
+	                        ? vk::ImageLayout::eGeneral
+	                        : vk::ImageLayout::eVideoEncodeSrcKHR;
+#ifdef VK_KHR_unified_image_layouts
+	if (std::get<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>(vk.feat).unifiedImageLayoutsVideo)
+		target_layout = vk::ImageLayout::eGeneral;
+#endif
 
 	// Decode picture buffer (DPB) images
 	vk::VideoFormatPropertiesKHR reference_picture_format = select_video_format(
@@ -417,7 +431,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		video_session =
 		        vk.device.createVideoSessionKHR(vk::VideoSessionCreateInfoKHR{
 		                .pNext = video_session_create_next,
-		                .queueFamilyIndex = vk.encode_queue_family_index,
+		                .queueFamilyIndex = encode_queue.family_index,
 		                //.flags = vk::VideoSessionCreateFlagBitsKHR::eAllowEncodeParameterOptimizations,
 		                .pVideoProfile = &video_profile,
 		                .pictureFormat = picture_format.format,
@@ -553,12 +567,24 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		vk.name(query_pool, std::format("vulkan encoder {} query pool", stream_idx));
 	}
 
+	// Each pool is bound to the queue family that records its timestamps; pools
+	// whose corresponding code path never runs stay dormant.
+	ts_pool = gpu_timestamp_pool(vk, encode_queue.family_index, num_slots, std::format("vulkan encoder {} encode", stream_idx));
+	if (tmp_image)
+		ts_pool_image_copy = gpu_timestamp_pool(vk, encode_queue.family_index, num_slots, std::format("vulkan encoder {} image-copy", stream_idx));
+	if (slot_data[0].host_buffer)
+	{
+		const uint32_t host_copy_family = vk.transfer_queue ? vk.transfer_queue.family_index : encode_queue.family_index;
+		ts_pool_host_copy = gpu_timestamp_pool(vk, host_copy_family, num_slots, std::format("vulkan encoder {} host-copy", stream_idx));
+		ts_pool_host_copy_overflow = gpu_timestamp_pool(vk, host_copy_family, num_slots, std::format("vulkan encoder {} host-copy-overflow", stream_idx));
+	}
+
 	// command pools
 	{
 		video_command_pool = vk.device.createCommandPool(
 		        vk::CommandPoolCreateInfo{
 		                .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
-		                .queueFamilyIndex = vk.encode_queue_family_index,
+		                .queueFamilyIndex = encode_queue.family_index,
 		        });
 		vk.name(video_command_pool, std::format("vulkan encoder {} video command pool", stream_idx));
 
@@ -574,12 +600,12 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 
 		if (slot_data[0].host_buffer)
 		{
-			if (*vk.transfer_queue)
+			if (vk.transfer_queue)
 			{
 				transfer_command_pool = vk.device.createCommandPool(
 				        vk::CommandPoolCreateInfo{
 				                .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
-				                .queueFamilyIndex = vk.transfer_queue_family_index,
+				                .queueFamilyIndex = vk.transfer_queue.family_index,
 				        });
 				vk.name(transfer_command_pool, std::format("vulkan encoder {} transfer command pool", stream_idx));
 
@@ -594,7 +620,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 			}
 			else
 			{
-				auto properties = vk.physical_device.getQueueFamilyProperties().at(vk.encode_queue_family_index);
+				auto properties = vk.physical_device.getQueueFamilyProperties().at(encode_queue.family_index);
 				if (not(properties.queueFlags & vk::QueueFlagBits::eTransfer))
 					throw std::runtime_error("Incorrect vulkan queues for video encode support");
 			}
@@ -633,20 +659,19 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 
 	if (tmp_image)
 	{
-		assert(slot_item.view);
+		assert(*slot_item.view);
 		image_view = slot_item.view;
 		compositor_sem.stageMask = vk::PipelineStageFlagBits2::eCopy;
 
 		beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 2> im_barriers;
-		vk::ImageLayout y_cbcr_layout{vk::ImageLayout::eGeneral};
 		if (need_transfer)
 		{
 			im_barriers.push_back(vk::ImageMemoryBarrier2{
 			        .dstStageMask = vk::PipelineStageFlagBits2KHR::eCopy,
 			        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-			        .oldLayout = y_cbcr_layout,
-			        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-			        .srcQueueFamilyIndex = vk.queue_family_index,
+			        .oldLayout = vk::ImageLayout::eGeneral,
+			        .newLayout = target_layout,
+			        .srcQueueFamilyIndex = vk.queue.family_index,
 			        .dstQueueFamilyIndex = target_queue,
 			        .image = y_cbcr,
 			        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -655,7 +680,6 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 			                             .baseArrayLayer = stream_idx,
 			                             .layerCount = 1},
 			});
-			y_cbcr_layout = vk::ImageLayout::eTransferSrcOptimal;
 		}
 		im_barriers.push_back(vk::ImageMemoryBarrier2{
 		        .dstStageMask = vk::PipelineStageFlagBits2KHR::eCopy,
@@ -675,9 +699,10 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		        .pImageMemoryBarriers = im_barriers.data(),
 		});
 
+		ts_pool_image_copy.cmd_begin(video_cmd_buf, encode_slot, frame_index, vk::PipelineStageFlagBits2::eCopy);
 		video_cmd_buf.copyImage(
 		        y_cbcr,
-		        y_cbcr_layout,
+		        target_layout,
 		        tmp_image,
 		        vk::ImageLayout::eTransferDstOptimal,
 		        std::array{
@@ -716,6 +741,7 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		                        },
 		                },
 		        });
+		ts_pool_image_copy.cmd_end(video_cmd_buf, encode_slot, vk::PipelineStageFlagBits2::eCopy);
 
 		vk::ImageMemoryBarrier2 tmp_image_barrier{
 		        .srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
@@ -739,27 +765,31 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 	else
 	{
 		compositor_sem.stageMask = vk::PipelineStageFlagBits2::eVideoEncodeKHR;
-		if (need_transfer)
-		{
-			vk::ImageMemoryBarrier2 video_barrier{
-			        .dstStageMask = vk::PipelineStageFlagBits2KHR::eVideoEncodeKHR,
-			        .dstAccessMask = vk::AccessFlagBits2::eVideoEncodeReadKHR,
-			        .oldLayout = vk::ImageLayout::eGeneral,
-			        .newLayout = vk::ImageLayout::eVideoEncodeSrcKHR,
-			        .srcQueueFamilyIndex = vk.queue_family_index,
-			        .dstQueueFamilyIndex = target_queue,
-			        .image = y_cbcr,
-			        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-			                             .baseMipLevel = 0,
-			                             .levelCount = 1,
-			                             .baseArrayLayer = stream_idx,
-			                             .layerCount = 1},
-			};
+		// Single barrier: when need_transfer, this is the QFOT acquire and
+		// carries the layout transition (eGeneral → target_layout) per the
+		// VkImageMemoryBarrier2 spec (executed once between the queues).
+		// When need_transfer is false (optimal cross-queue transfer, no QFOT)
+		// the same barrier degenerates to a plain layout transition.
+		// The transition may not even be needed, skipping the barrier entirely
+		vk::ImageMemoryBarrier2 barrier{
+		        .dstStageMask = vk::PipelineStageFlagBits2KHR::eVideoEncodeKHR,
+		        .dstAccessMask = vk::AccessFlagBits2::eVideoEncodeReadKHR,
+		        .oldLayout = vk::ImageLayout::eGeneral,
+		        .newLayout = target_layout,
+		        .srcQueueFamilyIndex = need_transfer ? vk.queue.family_index : vk::QueueFamilyIgnored,
+		        .dstQueueFamilyIndex = need_transfer ? target_queue : vk::QueueFamilyIgnored,
+		        .image = y_cbcr,
+		        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+		                             .baseMipLevel = 0,
+		                             .levelCount = 1,
+		                             .baseArrayLayer = stream_idx,
+		                             .layerCount = 1},
+		};
+		if (barrier.oldLayout != barrier.newLayout or barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex)
 			video_cmd_buf.pipelineBarrier2({
 			        .imageMemoryBarrierCount = 1,
-			        .pImageMemoryBarriers = &video_barrier,
+			        .pImageMemoryBarriers = &barrier,
 			});
-		}
 
 		auto it = image_views.find(VkImage(y_cbcr));
 		if (it != image_views.end())
@@ -827,7 +857,7 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		                             .baseMipLevel = 0,
 		                             .levelCount = 1,
 		                             .baseArrayLayer = 0,
-		                             .layerCount = vk::RemainingArrayLayers},
+		                             .layerCount = num_dpb_slots},
 		};
 		video_cmd_buf.pipelineBarrier2({
 		        .imageMemoryBarrierCount = 1,
@@ -897,7 +927,9 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		encode_info.setReferenceSlots(ref_slot->info);
 
 	video_cmd_buf.beginQuery(*query_pool, encode_slot, {});
+	ts_pool.cmd_begin(video_cmd_buf, encode_slot, frame_index, vk::PipelineStageFlagBits2::eVideoEncodeKHR);
 	video_cmd_buf.encodeVideoKHR(encode_info);
+	ts_pool.cmd_end(video_cmd_buf, encode_slot, vk::PipelineStageFlagBits2::eVideoEncodeKHR);
 	video_cmd_buf.endQuery(*query_pool, encode_slot);
 	video_cmd_buf.endVideoCodingKHR(vk::VideoEndCodingInfoKHR{});
 
@@ -916,8 +948,8 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 				        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
 				        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
 				        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-				        .srcQueueFamilyIndex = vk.encode_queue_family_index,
-				        .dstQueueFamilyIndex = vk.transfer_queue_family_index,
+				        .srcQueueFamilyIndex = encode_queue.family_index,
+				        .dstQueueFamilyIndex = vk.transfer_queue.family_index,
 				        .buffer = slot_item.output_buffer,
 				        .size = slot_item.copy_size,
 				};
@@ -929,12 +961,14 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 				cmd.pipelineBarrier2(dep_info);
 			}
 
+			ts_pool_host_copy.cmd_begin(cmd, encode_slot, frame_index, vk::PipelineStageFlagBits2::eCopy);
 			cmd.copyBuffer(
 			        slot_item.output_buffer,
 			        slot_item.host_buffer,
 			        vk::BufferCopy{
 			                .size = slot_item.copy_size,
 			        });
+			ts_pool_host_copy.cmd_end(cmd, encode_slot, vk::PipelineStageFlagBits2::eCopy);
 			cmd.end();
 		}
 		else
@@ -950,12 +984,14 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 			        .memoryBarrierCount = 1,
 			        .pMemoryBarriers = &mem_barrier,
 			});
+			ts_pool_host_copy.cmd_begin(video_cmd_buf, encode_slot, frame_index, vk::PipelineStageFlagBits2::eCopy);
 			video_cmd_buf.copyBuffer(
 			        slot_item.output_buffer,
 			        slot_item.host_buffer,
 			        vk::BufferCopy{
 			                .size = slot_item.copy_size,
 			        });
+			ts_pool_host_copy.cmd_end(video_cmd_buf, encode_slot, vk::PipelineStageFlagBits2::eCopy);
 		}
 	}
 
@@ -975,8 +1011,8 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		        .stageMask = vk::PipelineStageFlagBits2::eVideoEncodeKHR,
 		};
 
-		std::unique_lock lock(vk.encode_queue_mutex);
-		vk.encode_queue.submit2(
+		std::unique_lock lock(encode_queue.mutex);
+		encode_queue.queue.submit2(
 		        vk::SubmitInfo2{
 		                .waitSemaphoreInfoCount = 1,
 		                .pWaitSemaphoreInfos = &compositor_sem,
@@ -1000,14 +1036,14 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		        .stageMask = vk::PipelineStageFlagBits2::eTransfer,
 		};
 
-		std::unique_lock lock(vk.transfer_queue_mutex);
-		vk.transfer_queue.submit2(vk::SubmitInfo2{
-		                                  .waitSemaphoreInfoCount = 1,
-		                                  .pWaitSemaphoreInfos = &wait_info,
-		                                  .commandBufferInfoCount = 1,
-		                                  .pCommandBufferInfos = &cmd_info,
-		                          },
-		                          *slot_item.fence);
+		std::unique_lock lock(vk.transfer_queue.mutex);
+		vk.transfer_queue.queue.submit2(vk::SubmitInfo2{
+		                                        .waitSemaphoreInfoCount = 1,
+		                                        .pWaitSemaphoreInfos = &wait_info,
+		                                        .commandBufferInfoCount = 1,
+		                                        .pCommandBufferInfos = &cmd_info,
+		                                },
+		                                *slot_item.fence);
 	}
 }
 
@@ -1029,6 +1065,34 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		std::cerr << "device.getQueryPoolResults: " << vk::to_string(res) << std::endl;
 	}
 
+	if (auto s = ts_pool.collect(encode_slot))
+	{
+		wivrn::trace::gpu_slice(wivrn::trace::gpu_track::vulkan_encode,
+		                        "encodeVideoKHR",
+		                        s->begin_ns,
+		                        s->end_ns,
+		                        s->frame_index,
+		                        stream_idx);
+	}
+	if (auto s = ts_pool_image_copy.collect(encode_slot))
+	{
+		wivrn::trace::gpu_slice(wivrn::trace::gpu_track::vulkan_image_copy,
+		                        "vk_copy_image_tmp",
+		                        s->begin_ns,
+		                        s->end_ns,
+		                        s->frame_index,
+		                        stream_idx);
+	}
+	if (auto s = ts_pool_host_copy.collect(encode_slot))
+	{
+		wivrn::trace::gpu_slice(wivrn::trace::gpu_track::vulkan_host_copy,
+		                        "vk_copy_to_host",
+		                        s->begin_ns,
+		                        s->end_ns,
+		                        s->frame_index,
+		                        stream_idx);
+	}
+
 	// We don't copy the whole buffer, but an estimate of how much we'll need
 	// If that wasn't enough, we have to issue a second copy command for the rest
 	if (slot_item.host_buffer and size > slot_item.copy_size)
@@ -1040,6 +1104,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 
 		cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
+		ts_pool_host_copy_overflow.cmd_begin(cmd, encode_slot, frame_index, vk::PipelineStageFlagBits2::eCopy);
 		cmd.copyBuffer(
 		        slot_item.output_buffer,
 		        slot_item.host_buffer,
@@ -1048,12 +1113,13 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		                .dstOffset = slot_item.copy_size,
 		                .size = size - slot_item.copy_size,
 		        });
+		ts_pool_host_copy_overflow.cmd_end(cmd, encode_slot, vk::PipelineStageFlagBits2::eCopy);
 
 		cmd.end();
 
 		{
-			std::unique_lock lock(transfer_queue ? vk.transfer_queue_mutex : vk.encode_queue_mutex);
-			auto & queue = transfer_queue ? vk.transfer_queue : vk.encode_queue;
+			std::unique_lock lock(transfer_queue ? vk.transfer_queue.mutex : encode_queue.mutex);
+			auto & queue = (transfer_queue ? vk.transfer_queue : encode_queue).queue;
 
 			vk::CommandBufferSubmitInfo cmd_info{
 			        .commandBuffer = *cmd,
@@ -1071,6 +1137,16 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		{
 			U_LOG_E("Timeout on stream %d", stream_idx);
 			return {};
+		}
+
+		if (auto s = ts_pool_host_copy_overflow.collect(encode_slot))
+		{
+			wivrn::trace::gpu_slice(wivrn::trace::gpu_track::vulkan_host_copy_overflow,
+			                        "vk_copy_to_host_overflow",
+			                        s->begin_ns,
+			                        s->end_ns,
+			                        s->frame_index,
+			                        stream_idx);
 		}
 	}
 

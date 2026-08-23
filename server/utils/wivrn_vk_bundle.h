@@ -21,7 +21,8 @@
 
 #include "vk/vk_allocator.h"
 #include <cstdint>
-#include <mutex>
+#include <inplace_vector.hpp>
+#include <pthread.h>
 #include <type_traits>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
@@ -61,23 +62,61 @@ uint64_t vk_handle(const T & handle)
 
 struct vk_bundle
 {
+	static const uint32_t api_version = VK_API_VERSION_1_3;
+	// Lockable that can be redirected to a pthread_mutex_t owned by monado,
+	// so that all VkQueue submitters take the same lock.
+	class queue_mutex
+	{
+		pthread_mutex_t storage = PTHREAD_MUTEX_INITIALIZER;
+		pthread_mutex_t * mutex = &storage;
+
+	public:
+		queue_mutex() = default;
+		queue_mutex(const queue_mutex &) = delete;
+		queue_mutex & operator=(const queue_mutex &) = delete;
+		~queue_mutex()
+		{
+			pthread_mutex_destroy(&storage);
+		}
+		void lock()
+		{
+			pthread_mutex_lock(mutex);
+		}
+		bool try_lock()
+		{
+			return pthread_mutex_trylock(mutex) == 0;
+		}
+		void unlock()
+		{
+			pthread_mutex_unlock(mutex);
+		}
+		// external must be initialized, not currently locked, and
+		// outlive the last lock()
+		void share(pthread_mutex_t & external)
+		{
+			mutex = &external;
+		}
+	};
+
+	struct queue_data
+	{
+		queue_mutex mutex;
+		vk::raii::Queue queue = nullptr;
+		uint32_t family_index = vk::QueueFamilyIgnored;
+		operator bool() const
+		{
+			return *queue != VK_NULL_HANDLE;
+		}
+	};
 	vk::raii::Context vk_ctx;
 	vk::raii::Instance instance;
 	vk::raii::PhysicalDevice physical_device;
 	vk::raii::Device device;
 	std::optional<vk_allocator> allocator;
 
-	std::mutex queue_mutex;
-	vk::raii::Queue queue;
-	uint32_t queue_family_index;
-
-	std::mutex transfer_queue_mutex;
-	vk::raii::Queue transfer_queue;
-	uint32_t transfer_queue_family_index;
-
-	std::mutex encode_queue_mutex;
-	vk::raii::Queue encode_queue;
-	uint32_t encode_queue_family_index;
+	queue_data queue;
+	queue_data transfer_queue;
+	beman::inplace_vector::inplace_vector<queue_data, 3> encode_queues;
 
 	vk::raii::DebugUtilsMessengerEXT debug;
 
@@ -91,6 +130,9 @@ struct vk_bundle
 #endif
 #ifdef VK_KHR_video_encode_intra_refresh
 	        vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR,
+#endif
+#ifdef VK_KHR_unified_image_layouts
+	        vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
 #endif
 	        vk::PhysicalDeviceVulkan12Features,
 	        vk::PhysicalDeviceVulkan13Features>

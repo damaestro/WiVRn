@@ -136,7 +136,14 @@ Default value: `false`
 
 Only available when the `uinput` kernel module is loaded and the user has write access.
 
-Enables the forwarding of keyboard and mouse input from the client to the server.
+Mirrors input devices forwarded from the headset (keyboard, mouse, gamepad) to `uinput`
+devices, for applications that do not read them through OpenXR. Which devices are forwarded is
+chosen on the headset.
+
+A forwarded gamepad is also exposed as a native OpenXR gamepad at `/user/gamepad`, which needs
+no permission and is always available. Only the digested controller state is forwarded
+(buttons, two sticks, analog triggers and a d-pad), so device specific features such as gyro,
+adaptive triggers or the touchpad are not available.
 
 ## `debug-gui`
 Default value: `false`
@@ -151,6 +158,13 @@ Default value: `false`
 Only available when built with `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE`
 
 Enables the driver to load SteamVR Lighthouse devices.
+
+## `lh-stick-deadzone`
+Default value: `0`
+
+Only available when built with `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE`
+
+Applies a deadzone to joysticks on SteamVR controllers (e.g. Index).
 
 ## `port`
 Default value: `9757`

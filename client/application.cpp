@@ -19,7 +19,6 @@
 
 #include "application.h"
 
-#include "hardware.h"
 #include "openxr/openxr.h"
 #include "scene.h"
 #include "spdlog/common.h"
@@ -35,12 +34,12 @@
 #include "xr/check.h"
 #include "xr/htc_exts.h"
 #include "xr/htc_face_tracker.h"
-#include "xr/meta_body_tracking_fidelity.h"
 #include "xr/to_string.h"
 #include <algorithm>
 #include <boost/locale.hpp>
 #include <boost/url/parse.hpp>
 #include <chrono>
+#include <cstring>
 #include <ctype.h>
 #include <exception>
 #include <magic_enum.hpp>
@@ -479,6 +478,47 @@ static std::vector<interaction_profile> interaction_profiles{
                 },
         },
         interaction_profile{
+                .profile_name = "/interaction_profiles/yvr/touch_controller_yvr",
+                .input_sources = {
+                        "/user/hand/left/output/haptic",
+                        "/user/hand/right/output/haptic",
+
+                        "/user/hand/left/input/grip/pose",
+                        "/user/hand/left/input/aim/pose",
+
+                        "/user/hand/right/input/grip/pose",
+                        "/user/hand/right/input/aim/pose",
+
+                        "/user/hand/left/input/x/click",
+                        "/user/hand/left/input/x/touch",
+                        "/user/hand/left/input/y/click",
+                        "/user/hand/left/input/y/touch",
+                        "/user/hand/left/input/menu/click",
+                        "/user/hand/left/input/squeeze/value",
+                        "/user/hand/left/input/squeeze/click",
+                        "/user/hand/left/input/trigger/value",
+                        "/user/hand/left/input/trigger/touch",
+                        "/user/hand/left/input/thumbstick",
+                        "/user/hand/left/input/thumbstick/click",
+                        "/user/hand/left/input/thumbstick/touch",
+                        "/user/hand/left/input/thumbrest/touch",
+
+                        "/user/hand/right/input/a/click",
+                        "/user/hand/right/input/a/touch",
+                        "/user/hand/right/input/b/click",
+                        "/user/hand/right/input/b/touch",
+                        "/user/hand/right/input/system/click",
+                        "/user/hand/right/input/squeeze/value",
+                        "/user/hand/right/input/squeeze/click",
+                        "/user/hand/right/input/trigger/value",
+                        "/user/hand/right/input/trigger/touch",
+                        "/user/hand/right/input/thumbstick",
+                        "/user/hand/right/input/thumbstick/click",
+                        "/user/hand/right/input/thumbstick/touch",
+                        "/user/hand/right/input/thumbrest/touch",
+                },
+        },
+        interaction_profile{
                 .profile_name = "/interaction_profiles/htc/vive_focus3_controller",
                 .required_extensions = {XR_HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME},
                 .input_sources = {
@@ -563,6 +603,35 @@ static std::vector<interaction_profile> interaction_profiles{
                         "/user/eyes_ext/input/gaze_ext/pose",
                 },
         },
+        interaction_profile{
+                .profile_name = "/interaction_profiles/microsoft/xbox_controller",
+                .input_sources = {
+                        "/user/gamepad/input/menu/click",
+                        "/user/gamepad/input/view/click",
+                        "/user/gamepad/input/a/click",
+                        "/user/gamepad/input/b/click",
+                        "/user/gamepad/input/x/click",
+                        "/user/gamepad/input/y/click",
+                        "/user/gamepad/input/dpad_up/click",
+                        "/user/gamepad/input/dpad_down/click",
+                        "/user/gamepad/input/dpad_left/click",
+                        "/user/gamepad/input/dpad_right/click",
+                        "/user/gamepad/input/shoulder_left/click",
+                        "/user/gamepad/input/shoulder_right/click",
+                        "/user/gamepad/input/thumbstick_left/click",
+                        "/user/gamepad/input/thumbstick_right/click",
+                        "/user/gamepad/input/trigger_left/value",
+                        "/user/gamepad/input/trigger_right/value",
+                        "/user/gamepad/input/thumbstick_left/x",
+                        "/user/gamepad/input/thumbstick_left/y",
+                        "/user/gamepad/input/thumbstick_right/x",
+                        "/user/gamepad/input/thumbstick_right/y",
+                        "/user/gamepad/output/haptic_left",
+                        "/user/gamepad/output/haptic_right",
+                        "/user/gamepad/output/haptic_left_trigger",
+                        "/user/gamepad/output/haptic_right_trigger",
+                },
+        },
 };
 
 static const std::pair<std::string_view, XrActionType> action_suffixes[] =
@@ -595,11 +664,15 @@ static const std::pair<std::string_view, XrActionType> action_suffixes[] =
 		{"/ready_ext", XR_ACTION_TYPE_BOOLEAN_INPUT},
 
 		// Output paths
-		{"/haptic",           XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_trigger",   XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_trigger_fb",XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_thumb",     XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_thumb_fb",  XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic",              XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_trigger",      XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_trigger_fb",   XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_thumb",        XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_thumb_fb",     XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_left",         XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_right",        XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_left_trigger", XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_right_trigger",XR_ACTION_TYPE_VIBRATION_OUTPUT},
                 // clang-format on
 };
 
@@ -749,17 +822,13 @@ void application::initialize_vulkan()
 			instance_extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
 		}
 
-		if (!strcmp(i.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) and
-		    guess_model() != model::oculus_quest) // Quest 1 lies, the extension won't load
+		if (!strcmp(i.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) and get_hmd_traits().vk_debug_ext_allowed)
 		{
 			debug_utils_found = true;
 			instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 		}
 #endif
 	}
-	std::ranges::sort(extensions);
-	for (const auto & [extension_name, spec_version]: extensions)
-		spdlog::info("    {} (version {})", extension_name, spec_version);
 
 	vk_device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 	vk_device_extensions.push_back(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME);
@@ -780,6 +849,19 @@ void application::initialize_vulkan()
 	instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 	instance_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
 #endif
+
+	std::ranges::sort(extensions);
+	for (const auto & [extension_name, spec_version]: extensions)
+	{
+		if (runtime_hmd_traits.blacklisted_extensions.contains(extension_name))
+		{
+			spdlog::info("    {} (version {}) (blacklisted)", extension_name, spec_version);
+			if (std::ranges::find(instance_extensions, extension_name) != instance_extensions.end())
+				throw std::runtime_error("Required Vulkan instance extension is blacklisted");
+		}
+		else
+			spdlog::info("    {} (version {})", extension_name, spec_version);
+	}
 
 	vk::ApplicationInfo application_info{
 	        .pApplicationName = app_info.name.c_str(),
@@ -840,9 +922,19 @@ void application::initialize_vulkan()
 	spdlog::info("Available Vulkan device extensions:");
 	for (const auto & [extension_name, spec_version]: extensions)
 	{
-		spdlog::info("    {} (version {})", extension_name, spec_version);
-		if (auto it = optional_device_extensions.find(extension_name); it != optional_device_extensions.end())
-			vk_device_extensions.push_back(it->data());
+		if (runtime_hmd_traits.blacklisted_extensions.contains(extension_name))
+		{
+			spdlog::info("    {} (version {}) (blacklisted)", extension_name, spec_version);
+
+			if (std::ranges::find(vk_device_extensions, extension_name) != instance_extensions.end())
+				throw std::runtime_error("Required Vulkan device extension is blacklisted");
+		}
+		else
+		{
+			spdlog::info("    {} (version {})", extension_name, spec_version);
+			if (auto it = optional_device_extensions.find(extension_name); it != optional_device_extensions.end())
+				vk_device_extensions.push_back(it->data());
+		}
 	}
 
 	spdlog::info("Initializing Vulkan with device {}", physical_device_properties.deviceName.data());
@@ -1006,21 +1098,8 @@ void application::initialize_actions()
 		profile.available = std::ranges::all_of(profile.required_extensions, [&](auto & ext) { return xr_instance.has_extension(ext); }) and
 		                    profile.min_version <= api_version;
 
-		if (profile.profile_name.ends_with("khr/simple_controller"))
-		{
-			switch (guess_model())
-			{
-				// Quest hand tracking creates a fake khr/simple_controller when hand tracking
-				// is enabled, this messes with native hand tracking
-				case model::meta_quest_3:
-				case model::meta_quest_pro:
-				case model::meta_quest_3s:
-				case model::oculus_quest_2:
-					profile.available = false;
-				default:
-					break;
-			}
-		}
+		if (profile.profile_name.ends_with("khr/simple_controller") and not get_hmd_traits().bind_simple_controller)
+			profile.available = false;
 
 		if (!profile.available)
 			continue;
@@ -1028,21 +1107,8 @@ void application::initialize_actions()
 		// Patch profile to add grip_surface or palm_ext
 		bool add_palms = true;
 		if (profile.profile_name.ends_with("ext/hand_interaction_ext"))
-		{
-			switch (guess_model())
-			{
-				// Quest breaks spec and does not support grip_surface for ext/hand_interaction_ext
-				case model::meta_quest_3:
-				case model::meta_quest_pro:
-				case model::meta_quest_3s:
-				case model::oculus_quest_2:
-				case model::oculus_quest:
-					add_palms = false;
-					break;
-				default:
-					break;
-			}
-		}
+			add_palms = get_hmd_traits().hand_interaction_grip_surface;
+
 		if (add_palms)
 		{
 			if ((api_version >= XR_MAKE_VERSION(1, 1, 0) or xr_instance.has_extension(XR_KHR_MAINTENANCE1_EXTENSION_NAME)) //
@@ -1212,6 +1278,7 @@ void application::initialize_actions()
 
 void application::initialize()
 {
+	runtime_hmd_traits.init();
 	// LogLayersAndExtensions
 	assert(!xr_instance);
 	std::vector<const char *> xr_extensions{
@@ -1230,6 +1297,7 @@ void application::initialize()
 	        XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,
 	        XR_EXT_HAND_INTERACTION_EXTENSION_NAME,
 	        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
+	        XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME,
 	        XR_EXT_PALM_POSE_EXTENSION_NAME,
 	        XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME,
 	        XR_EXT_USER_PRESENCE_EXTENSION_NAME,
@@ -1264,7 +1332,7 @@ void application::initialize()
 		auto it = std::find_if(opt_extensions.begin(),
 		                       opt_extensions.end(),
 		                       [&ext](const char * i) { return strcmp(i, ext.extensionName) == 0; });
-		if (it != opt_extensions.end())
+		if (it != opt_extensions.end() and not runtime_hmd_traits.blacklisted_extensions.contains(ext.extensionName))
 			xr_extensions.push_back(*it);
 	}
 
@@ -1336,7 +1404,8 @@ void application::initialize()
 	spaces[size_t(xr::spaces::view)] = xr_session.create_reference_space(XR_REFERENCE_SPACE_TYPE_VIEW);
 	spaces[size_t(xr::spaces::world)] = xr_session.create_reference_space(XR_REFERENCE_SPACE_TYPE_STAGE);
 
-	config.emplace(xr_system_id, xr_session);
+	config.emplace(xr_system_id, xr_session, application::get_config_path() / "client.json");
+	default_config.emplace(xr_system_id, xr_session);
 
 	// HTC face tracker fails if created later
 	// we can destroy it right away, it actually stores static handles
@@ -1703,8 +1772,10 @@ void application::run()
 		while (ALooper_pollOnce(100, nullptr, &events, (void **)&source) >= 0)
 		{
 			// Process this event.
-			if (source != nullptr)
-				source->process(app_info.native_app, source);
+			if (source == nullptr)
+				continue;
+
+			source->process(app_info.native_app, source);
 		}
 
 		if (app_info.native_app->destroyRequested)

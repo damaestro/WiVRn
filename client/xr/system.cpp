@@ -28,6 +28,7 @@
 #include "xr/check.h"
 #include "xr/instance.h"
 #include <cassert>
+#include <stdexcept>
 #include <openxr/openxr_platform.h>
 
 xr::system::system(xr::instance & inst, XrFormFactor formfactor)
@@ -46,6 +47,9 @@ xr::system::system(xr::instance & inst, XrFormFactor formfactor)
 
 	if (inst.has_extension(XR_EXT_HAND_TRACKING_EXTENSION_NAME))
 		hand_tracking_supported_ = hand_tracking_properties().supportsHandTracking;
+
+	if (hand_tracking_supported_ and inst.has_extension(XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME))
+		hand_mesh_fb_supported_ = true;
 
 	body_tracker = xr::body_tracker_supported(inst, *this);
 	face_tracker = xr::face_tracker_supported(inst, *this);
@@ -202,6 +206,23 @@ XrSystemBodyTrackingPropertiesFB xr::system::fb_body_tracking_properties() const
 
 	return body_tracking_prop;
 }
+XrSystemPropertiesBodyTrackingFullBodyMETA xr::system::meta_body_tracking_properties() const
+{
+	if (!id)
+		throw std::invalid_argument("this");
+
+	XrSystemPropertiesBodyTrackingFullBodyMETA body_tracking_prop{
+	        .type = XR_TYPE_SYSTEM_PROPERTIES_BODY_TRACKING_FULL_BODY_META,
+	};
+
+	XrSystemProperties prop{
+	        .type = XR_TYPE_SYSTEM_PROPERTIES,
+	        .next = &body_tracking_prop,
+	};
+	CHECK_XR(xrGetSystemProperties(*inst, id, &prop));
+
+	return body_tracking_prop;
+}
 
 XrSystemBodyTrackingPropertiesBD xr::system::bd_body_tracking_properties() const
 {
@@ -273,6 +294,11 @@ xr::body_tracker_type xr::system::body_tracker_supported() const
 bool xr::system::hand_tracking_supported() const
 {
 	return hand_tracking_supported_;
+}
+
+bool xr::system::hand_mesh_fb_supported() const
+{
+	return hand_mesh_fb_supported_;
 }
 
 vk::raii::PhysicalDevice xr::system::physical_device(vk::raii::Instance & vulkan) const

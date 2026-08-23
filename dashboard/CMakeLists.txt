@@ -1,11 +1,13 @@
 include(KDEInstallDirs)
 include(KDECMakeSettings)
+include(ECMFeatureSummary)
 include(ECMFindQmlModule)
 include(ECMQmlModule)
 include(I18n)
 
 ecm_find_qmlmodule(org.kde.kirigami REQUIRED)
 ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
+ecm_feature_summary(WHAT REQUIRED_PACKAGES_NOT_FOUND FATAL_ON_MISSING_REQUIRED_PACKAGES)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -74,8 +76,9 @@ target_link_libraries(wivrn-dashboard
     Qt6::Gui
     Qt6::QuickControls2
     Qt6::Widgets
-    KF6::I18n
     KF6::CoreAddons
+    KF6::I18n
+    KF6::I18nQml
     KF6::IconThemes
     KF6::Kirigami
     QCoro::Core
